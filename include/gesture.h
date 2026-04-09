@@ -6,20 +6,17 @@
 #include "pin_config.h"
 
 // =============================================================
-// Gesture Engine for Air-Drawn Numbers
+// Gesture Engine V2 — Air-Drawn Number Recognition
 //
-// How it works:
-//   1. CAPTURE: Record raw accelerometer samples while user draws
-//   2. BIN:     Compress variable-length samples into fixed NUM_BINS
-//               time slices (this normalizes for speed differences)
-//   3. NORMALIZE: Remove gravity offset and scale to unit variance
-//               (this normalizes for amplitude/orientation differences)
-//   4. COMPARE: Euclidean distance between two normalized bin vectors
+// V1 BUG: Per-axis normalization destroyed inter-axis relationships.
+//          A circle and a straight line looked identical after
+//          normalizing each axis independently.
 //
-// Memory layout:
-//   Raw buffer:  int16_t[MAX_SAMPLES][3] = 600 bytes (temporary)
-//   Bin vector:  float[NUM_BINS][3] = 120 bytes per gesture
-//   Stored key:  3 × 120 = 360 bytes (in EEPROM)
+// V2 FIX: Normalize all axes by ONE shared factor (total energy).
+//          This preserves the SHAPE (ratio between axes) while
+//          still allowing different drawing sizes.
+//
+// Also added: debug dump to Serial for visualization.
 // =============================================================
 
 // --- Binned feature vector for one gesture ---
@@ -29,8 +26,7 @@ struct GestureBins {
     float z[NUM_BINS];
 };
 
-// --- Raw sample storage (int16_t to save RAM) ---
-// These are the raw LIS3DH register values (lis.x, lis.y, lis.z)
+// --- Raw sample storage ---
 struct RawSample {
     int16_t x, y, z;
 };
@@ -43,12 +39,10 @@ static uint16_t  raw_count = 0;
 // Capture Functions
 // =============================================================
 
-// Reset before starting a new capture
 static void capture_reset(void) {
     raw_count = 0;
 }
 
-// Add one raw sample. Returns false if buffer is full.
 static bool capture_add(int16_t x, int16_t y, int16_t z) {
     if (raw_count >= MAX_SAMPLES) return false;
     raw_buf[raw_count].x = x;
@@ -58,17 +52,32 @@ static bool capture_add(int16_t x, int16_t y, int16_t z) {
     return true;
 }
 
-// Check if we have enough samples for a valid gesture
 static bool capture_valid(void) {
     return raw_count >= MIN_SAMPLES;
 }
 
 // =============================================================
+// Debug: Dump raw samples to Serial as CSV
+// Paste output into a plotter to see gesture shape.
+// Format: index,x,y,z
+// =============================================================
+static void capture_dump_serial(void) {
+    Serial.println(F("--- RAW DATA START ---"));
+    Serial.println(F("i,x,y,z"));
+    for (uint16_t i = 0; i < raw_count; i++) {
+        Serial.print(i);
+        Serial.print(F(","));
+        Serial.print(raw_buf[i].x);
+        Serial.print(F(","));
+        Serial.print(raw_buf[i].y);
+        Serial.print(F(","));
+        Serial.println(raw_buf[i].z);
+    }
+    Serial.println(F("--- RAW DATA END ---"));
+}
+
+// =============================================================
 // Binning — Compress raw samples into NUM_BINS time slices
-//
-// If we have 80 raw samples and NUM_BINS=10, each bin gets ~8
-// samples averaged together. This makes the feature vector
-// independent of gesture duration (speed normalization).
 // =============================================================
 
 static GestureBins capture_to_bins(void) {
@@ -77,16 +86,13 @@ static GestureBins capture_to_bins(void) {
 
     if (raw_count == 0) return bins;
 
-    // How many raw samples per bin (can be fractional)
     float samples_per_bin = (float)raw_count / NUM_BINS;
 
     for (uint8_t b = 0; b < NUM_BINS; b++) {
-        // Calculate which raw samples fall into this bin
         uint16_t start = (uint16_t)(b * samples_per_bin);
         uint16_t end   = (uint16_t)((b + 1) * samples_per_bin);
         if (end > raw_count) end = raw_count;
         if (start >= end) {
-            // Edge case: copy previous bin or leave as zero
             if (b > 0) {
                 bins.x[b] = bins.x[b - 1];
                 bins.y[b] = bins.y[b - 1];
@@ -95,7 +101,6 @@ static GestureBins capture_to_bins(void) {
             continue;
         }
 
-        // Average the samples in this bin
         float sx = 0, sy = 0, sz = 0;
         uint16_t count = end - start;
         for (uint16_t i = start; i < end; i++) {
@@ -112,16 +117,19 @@ static GestureBins capture_to_bins(void) {
 }
 
 // =============================================================
-// Normalization — Remove DC offset and scale to unit variance
+// V2 Normalization — Subtract mean, then normalize by TOTAL energy
 //
-// Why: When you draw "3" while holding the board tilted vs flat,
-// the gravity component shifts all readings. Subtracting the mean
-// per axis removes this. Dividing by standard deviation makes the
-// comparison independent of how "hard" you drew.
+// Key difference from V1:
+//   V1: divided each axis by its own std dev → destroyed shape
+//   V2: divide ALL axes by the same global magnitude → preserves shape
+//
+// Example: Drawing "1" (mostly Y-axis) vs "—" (mostly X-axis)
+//   V1: After per-axis norm, both look like [0,0,...,1,1,...,0,0]
+//   V2: "1" keeps high Y, low X.  "—" keeps high X, low Y.
 // =============================================================
 
 static void normalize_bins(GestureBins *bins) {
-    // --- Compute mean per axis ---
+    // --- Step 1: Subtract mean per axis (removes gravity offset) ---
     float mx = 0, my = 0, mz = 0;
     for (uint8_t i = 0; i < NUM_BINS; i++) {
         mx += bins->x[i];
@@ -132,33 +140,55 @@ static void normalize_bins(GestureBins *bins) {
     my /= NUM_BINS;
     mz /= NUM_BINS;
 
-    // --- Subtract mean ---
     for (uint8_t i = 0; i < NUM_BINS; i++) {
         bins->x[i] -= mx;
         bins->y[i] -= my;
         bins->z[i] -= mz;
     }
 
-    // --- Compute standard deviation per axis ---
-    float vx = 0, vy = 0, vz = 0;
+    // --- Step 2: Compute TOTAL energy across ALL axes ---
+    float energy = 0;
     for (uint8_t i = 0; i < NUM_BINS; i++) {
-        vx += bins->x[i] * bins->x[i];
-        vy += bins->y[i] * bins->y[i];
-        vz += bins->z[i] * bins->z[i];
+        energy += bins->x[i] * bins->x[i];
+        energy += bins->y[i] * bins->y[i];
+        energy += bins->z[i] * bins->z[i];
     }
-    float sx = sqrt(vx / NUM_BINS);
-    float sy = sqrt(vy / NUM_BINS);
-    float sz = sqrt(vz / NUM_BINS);
+    float norm = sqrt(energy);
 
-    // --- Divide by std dev (avoid div by zero) ---
+    // --- Step 3: Divide ALL axes by the SAME norm ---
+    // This preserves the ratio between axes (the shape)
+    // while normalizing for amplitude (how big you drew)
     float eps = 0.001f;
-    if (sx > eps) { for (uint8_t i = 0; i < NUM_BINS; i++) bins->x[i] /= sx; }
-    if (sy > eps) { for (uint8_t i = 0; i < NUM_BINS; i++) bins->y[i] /= sy; }
-    if (sz > eps) { for (uint8_t i = 0; i < NUM_BINS; i++) bins->z[i] /= sz; }
+    if (norm > eps) {
+        for (uint8_t i = 0; i < NUM_BINS; i++) {
+            bins->x[i] /= norm;
+            bins->y[i] /= norm;
+            bins->z[i] /= norm;
+        }
+    }
 }
 
 // =============================================================
-// Comparison — Euclidean distance between two normalized vectors
+// Debug: Print binned features to Serial
+// =============================================================
+static void bins_dump_serial(const GestureBins *bins, uint8_t gesture_num) {
+    Serial.print(F("  [Bins G"));
+    Serial.print(gesture_num + 1);
+    Serial.println(F("]"));
+    for (uint8_t i = 0; i < NUM_BINS; i++) {
+        Serial.print(F("    bin"));
+        Serial.print(i);
+        Serial.print(F(": x="));
+        Serial.print(bins->x[i], 3);
+        Serial.print(F(" y="));
+        Serial.print(bins->y[i], 3);
+        Serial.print(F(" z="));
+        Serial.println(bins->z[i], 3);
+    }
+}
+
+// =============================================================
+// Comparison — Euclidean distance between normalized vectors
 // =============================================================
 
 static float gesture_distance(const GestureBins *a, const GestureBins *b) {
@@ -169,7 +199,7 @@ static float gesture_distance(const GestureBins *a, const GestureBins *b) {
         float dz = a->z[i] - b->z[i];
         dist += dx * dx + dy * dy + dz * dz;
     }
-    return sqrt(dist / NUM_BINS);  // RMS distance per bin
+    return sqrt(dist);
 }
 
 static bool gesture_matches(const GestureBins *attempt, const GestureBins *stored) {
@@ -178,8 +208,7 @@ static bool gesture_matches(const GestureBins *attempt, const GestureBins *store
 }
 
 // =============================================================
-// Full Pipeline: raw buffer → bins → normalize → ready
-// Call after capture is done.
+// Full Pipeline: capture → bin → normalize
 // =============================================================
 
 static GestureBins capture_finalize(void) {
@@ -190,15 +219,10 @@ static GestureBins capture_finalize(void) {
 
 // =============================================================
 // Motion Detection
-//
-// Uses the magnitude of raw accelerometer values.
-// At rest with LIS3DH at ±4g range, raw values for 1g ≈ 8192.
-// Magnitude at rest ≈ 8192 (pure gravity).
-// If magnitude deviates significantly, the board is moving.
 // =============================================================
 
-#define RAW_REST_MAG    8192.0f     // ~1g in raw units at ±4g range
-#define RAW_MOTION_THR  2500.0f     // deviation from rest to count as moving
+#define RAW_REST_MAG    8192.0f
+#define RAW_MOTION_THR  1500.0f
 
 static bool is_moving_raw(int16_t x, int16_t y, int16_t z) {
     float mag = sqrt((float)x * x + (float)y * y + (float)z * z);

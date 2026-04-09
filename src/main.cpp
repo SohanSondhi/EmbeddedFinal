@@ -1,42 +1,18 @@
 // =============================================================
-// KinetiKey — "Old Lock, New Twist"
+// KinetiKey V2 — "Old Lock, New Twist"
 // Embedded Challenge Spring 2026
 //
-// Board:  Adafruit Circuit Playground Classic (ATmega32u4 @ 16MHz)
-// Accel:  LIS3DH (onboard, I2C @ 0x18)
-// IDE:    PlatformIO (Arduino framework)
-//
-// CONTROLS:
-//   LEFT  button → Record new 3-gesture key
-//   RIGHT button → Unlock attempt
-//   BOTH  buttons held → Cancel current operation / soft reset
-//   Slide switch LEFT + LEFT button in IDLE → Erase stored key
-//
-// FLOW:
-//   Record: Press LEFT → draw number 1 → draw number 2 → draw number 3
-//           → key saved to EEPROM → back to idle
-//
-//   Unlock: Press RIGHT → draw number 1 → draw number 2 → draw number 3
-//           → if all match → green animation (unlocked!)
-//           → if any fails → red flash (locked)
-//
-// LED COLORS:
-//   Blue dots          = idle, ready
-//   Purple             = recording mode
-//   Yellow             = unlock mode
-//   Green progressive  = each correct gesture
-//   Green chase        = fully unlocked
-//   Red blink          = failed / error
-//   Orange blink       = no key stored yet
-//   White spinning     = currently capturing gesture
-//
-// SERIAL MONITOR:
-//   Open at 9600 baud for debug info including gesture distances,
-//   which is essential for tuning MATCH_THRESHOLD in pin_config.h.
+// CHANGES FROM V1:
+//   - Fixed normalization (global energy, not per-axis)
+//   - Added countdown before each gesture
+//   - Added raw data dump to Serial for visualization
+//   - More bins (16) for better shape detail
+//   - Lower threshold (1.0) since discrimination is now better
+//   - Longer reposition time between gestures
 // =============================================================
 
 #include <Arduino.h>
-#include <Wire.h>
+#include <SPI.h>
 #include <Adafruit_LIS3DH.h>
 #include <Adafruit_Sensor.h>
 
@@ -45,49 +21,44 @@
 #include "gesture.h"
 #include "storage.h"
 
-// =============================================================
-// Accelerometer (I2C via Adafruit library — allowed per rules)
-// =============================================================
-Adafruit_LIS3DH accel = Adafruit_LIS3DH();
+Adafruit_LIS3DH accel = Adafruit_LIS3DH(8);
 
-// =============================================================
-// State Machine
-// =============================================================
 enum State {
-    ST_IDLE,                // Waiting for button press
-    ST_RECORD_WAIT,         // Record mode: waiting for user to start gesture
-    ST_RECORD_CAPTURE,      // Record mode: capturing gesture data
-    ST_UNLOCK_WAIT,         // Unlock mode: waiting for user to start gesture
-    ST_UNLOCK_CAPTURE,      // Unlock mode: capturing gesture data
-    ST_UNLOCKED,            // Unlock success — show animation
-    ST_FAILED               // Unlock failed — show animation
+    ST_IDLE,
+    ST_COUNTDOWN,           // NEW: countdown before gesture
+    ST_RECORD_WAIT,
+    ST_RECORD_CAPTURE,
+    ST_UNLOCK_WAIT,
+    ST_UNLOCK_CAPTURE,
+    ST_UNLOCKED,
+    ST_FAILED
+};
+
+// Which mode are we in during countdown?
+enum Mode {
+    MODE_RECORD,
+    MODE_UNLOCK
 };
 
 static State        state = ST_IDLE;
-static uint8_t      gesture_idx = 0;       // Which gesture (0, 1, 2) we're on
-static GestureBins  stored_key[NUM_GESTURES];   // Loaded from EEPROM
-static bool         key_exists = false;         // Is there a valid key?
+static Mode         mode = MODE_RECORD;
+static uint8_t      gesture_idx = 0;
+static GestureBins  stored_key[NUM_GESTURES];
+static bool         key_exists = false;
 
-// Timing
-static unsigned long state_enter_time = 0;      // When we entered current state
-static unsigned long last_sample_ms = 0;        // Last accelerometer sample time
-static unsigned long last_motion_ms = 0;        // Last time motion was detected
-static bool          saw_motion = false;         // Did we see motion this capture?
-static uint8_t       anim_tick = 0;              // For spinning animation
+static unsigned long state_enter_time = 0;
+static unsigned long last_sample_ms = 0;
+static unsigned long last_motion_ms = 0;
+static bool          saw_motion = false;
+static uint8_t       anim_tick = 0;
 
-// =============================================================
-// Helper: Read raw accelerometer data
-// =============================================================
 static void read_accel_raw(int16_t &x, int16_t &y, int16_t &z) {
-    accel.read();       // Updates accel.x, accel.y, accel.z (int16_t)
+    accel.read();
     x = accel.x;
     y = accel.y;
     z = accel.z;
 }
 
-// =============================================================
-// Helper: Transition to a new state
-// =============================================================
 static void go_to(State new_state) {
     state = new_state;
     state_enter_time = millis();
@@ -95,17 +66,12 @@ static void go_to(State new_state) {
     anim_tick = 0;
 }
 
-// =============================================================
-// Helper: Check for cancel (both buttons held)
-// Returns true if cancelled — caller should return immediately.
-// =============================================================
 static bool check_cancel(void) {
     if (both_buttons_held()) {
         Serial.println(F("--- CANCELLED ---"));
         neo_cancel_feedback();
         neo_idle_indicator();
         go_to(ST_IDLE);
-        // Wait for buttons to be released
         while (btn_left_raw() || btn_right_raw()) { _delay_ms(10); }
         return true;
     }
@@ -113,62 +79,109 @@ static bool check_cancel(void) {
 }
 
 // =============================================================
+// Countdown helper — shows "get ready" with LED countdown
+// =============================================================
+static void start_countdown(Mode m) {
+    mode = m;
+    go_to(ST_COUNTDOWN);
+
+    Color c = (m == MODE_RECORD) ? COLOR_PURPLE : COLOR_YELLOW;
+
+    Serial.print(F("  Get ready for gesture "));
+    Serial.print(gesture_idx + 1);
+    Serial.println(F("..."));
+
+    // Visual countdown: fill pixels from 0 to 9 over COUNTDOWN_MS
+    uint16_t step_ms = COUNTDOWN_MS / NUM_PIXELS;
+    for (uint8_t i = 0; i < NUM_PIXELS; i++) {
+        neo_fill(COLOR_OFF);
+        // Show previous gesture progress
+        for (uint8_t g = 0; g < gesture_idx; g++) {
+            for (uint8_t p = g * 3; p < (g * 3) + 3 && p < NUM_PIXELS; p++) {
+                pixel_buf[p] = (m == MODE_RECORD) ? COLOR_PURPLE : COLOR_GREEN;
+            }
+        }
+        // Countdown fill
+        neo_set(NUM_PIXELS - 1 - i, c);
+        neo_show();
+
+        // Check for cancel during countdown
+        for (uint16_t t = 0; t < step_ms / 10; t++) {
+            _delay_ms(10);
+            if (both_buttons_held()) {
+                check_cancel();
+                return;
+            }
+        }
+    }
+
+    // Flash to signal "GO!"
+    neo_fill(c);
+    neo_show();
+    _delay_ms(200);
+    neo_clear();
+
+    Serial.print(F("  GO! Draw gesture "));
+    Serial.print(gesture_idx + 1);
+    Serial.println(F(" now!"));
+
+    // Transition to wait state
+    if (m == MODE_RECORD) {
+        go_to(ST_RECORD_WAIT);
+    } else {
+        go_to(ST_UNLOCK_WAIT);
+    }
+}
+
+// =============================================================
 // SETUP
 // =============================================================
 void setup() {
-    // --- Serial for debug ---
     Serial.begin(9600);
+    while (!Serial) { delay(10); }
 
-    // --- Register-level GPIO init ---
     gpio_init();
-
-    // --- Boot animation ---
     neo_boot_animation();
 
-    // --- Init accelerometer ---
-    if (!accel.begin(0x18)) {   // I2C address on CP Classic
+    if (!accel.begin()) {
         Serial.println(F("ERROR: LIS3DH not found!"));
-        neo_error();  // Blinks red forever — will not continue
+        neo_error();
     }
 
-    // Set range to ±4g (good for hand gestures — not too sensitive, not too dull)
     accel.setRange(LIS3DH_RANGE_4_G);
-    // Set data rate to 50Hz (matches our SAMPLE_RATE_MS of 20ms)
     accel.setDataRate(LIS3DH_DATARATE_50_HZ);
+    Serial.println(F("LIS3DH initialized (SPI, +/-4g, 50Hz)"));
+    Serial.print(F("Threshold: "));
+    Serial.println(MATCH_THRESHOLD, 2);
+    Serial.print(F("Bins: "));
+    Serial.println(NUM_BINS);
 
-    Serial.println(F("LIS3DH initialized (I2C, ±4g, 50Hz)"));
-
-    // --- Load key from EEPROM if it exists ---
     key_exists = storage_load(stored_key);
     if (key_exists) {
         Serial.println(F("Stored key loaded from EEPROM."));
         neo_flash(COLOR_GREEN, 300);
     } else {
-        Serial.println(F("No stored key found. Record one first."));
+        Serial.println(F("No stored key found."));
         neo_flash(COLOR_ORANGE, 300);
     }
 
-    // --- Go to idle ---
     neo_idle_indicator();
     go_to(ST_IDLE);
 
     Serial.println(F(""));
-    Serial.println(F("=== KinetiKey Ready ==="));
-    Serial.println(F("LEFT  button = Record new key"));
-    Serial.println(F("RIGHT button = Unlock attempt"));
-    Serial.println(F("BOTH  buttons = Cancel / Reset"));
-    Serial.println(F("======================"));
+    Serial.println(F("=== KinetiKey V2 Ready ==="));
+    Serial.println(F("LEFT  = Record | RIGHT = Unlock | BOTH = Erase"));
+    Serial.println(F("=========================="));
     Serial.println(F(""));
 }
 
 // =============================================================
-// STATE: IDLE
+// IDLE
 // =============================================================
 static void do_idle(void) {
-    // --- LEFT button: Record ---
-    if (btn_left_pressed()) {
-        // If slide switch is to the left AND left button pressed → erase key
-        if (switch_left()) {
+    if (btn_left_raw() && btn_right_raw()) {
+        _delay_ms(500);
+        if (btn_left_raw() && btn_right_raw()) {
             Serial.println(F("*** ERASING stored key ***"));
             storage_erase();
             key_exists = false;
@@ -176,32 +189,26 @@ static void do_idle(void) {
             _delay_ms(200);
             neo_flash(COLOR_RED, 500);
             neo_idle_indicator();
+            while (btn_left_raw() || btn_right_raw()) { _delay_ms(10); }
             return;
         }
+    }
 
+    if (btn_left_pressed()) {
         Serial.println(F(""));
         Serial.println(F("=== RECORD MODE ==="));
-        Serial.println(F("Draw 3 numbers in the air while holding the board."));
+        Serial.println(F("Hold board in fist. Draw 3 numbers in the air."));
         gesture_idx = 0;
-
-        neo_flash(COLOR_PURPLE, 400);
-
-        // Wait for button release + settle time
+        neo_flash(COLOR_PURPLE, 300);
         while (btn_left_raw()) { _delay_ms(10); }
-        _delay_ms(SETTLE_MS);
 
-        go_to(ST_RECORD_WAIT);
-        neo_waiting_pulse(COLOR_PURPLE, 0);
-
-        Serial.print(F("Waiting for gesture 1 of 3..."));
-        Serial.println();
+        start_countdown(MODE_RECORD);
         return;
     }
 
-    // --- RIGHT button: Unlock ---
     if (btn_right_pressed()) {
         if (!key_exists) {
-            Serial.println(F("No key stored! Record one first (LEFT button)."));
+            Serial.println(F("No key stored! Press LEFT to record."));
             neo_no_key_warning();
             neo_idle_indicator();
             return;
@@ -211,50 +218,50 @@ static void do_idle(void) {
         Serial.println(F("=== UNLOCK MODE ==="));
         Serial.println(F("Replicate your 3-gesture key."));
         gesture_idx = 0;
-
-        neo_flash(COLOR_YELLOW, 400);
-
-        // Wait for button release + settle time
+        neo_flash(COLOR_YELLOW, 300);
         while (btn_right_raw()) { _delay_ms(10); }
-        _delay_ms(SETTLE_MS);
 
-        go_to(ST_UNLOCK_WAIT);
-        neo_waiting_pulse(COLOR_YELLOW, 0);
-
-        Serial.print(F("Waiting for gesture 1 of 3..."));
-        Serial.println();
+        start_countdown(MODE_UNLOCK);
         return;
     }
 }
 
 // =============================================================
-// STATE: RECORD_WAIT — Waiting for motion to start a gesture
+// COUNTDOWN (handled inline in start_countdown)
+// =============================================================
+static void do_countdown(void) {
+    // Should not stay here — start_countdown transitions out
+    // But if we somehow get stuck, go back to idle
+    if (millis() - state_enter_time > 5000) {
+        go_to(ST_IDLE);
+    }
+}
+
+// =============================================================
+// RECORD_WAIT
 // =============================================================
 static void do_record_wait(void) {
     if (check_cancel()) return;
 
-    // Timeout check
     if (millis() - state_enter_time > GESTURE_TIMEOUT_MS) {
-        Serial.println(F("Timeout — no gesture detected. Returning to idle."));
+        Serial.println(F("Timeout. Returning to idle."));
         neo_flash(COLOR_ORANGE, 300);
         neo_idle_indicator();
         go_to(ST_IDLE);
         return;
     }
 
-    // Blink waiting indicator periodically
-    if ((millis() / 500) % 2 == 0) {
+    // Blink
+    if ((millis() / 400) % 2 == 0) {
         neo_waiting_pulse(COLOR_PURPLE, gesture_idx);
     } else {
         neo_show_progress(gesture_idx, COLOR_PURPLE);
     }
 
-    // Check for motion
     int16_t x, y, z;
     read_accel_raw(x, y, z);
 
     if (is_moving_raw(x, y, z)) {
-        // Motion started — begin capture
         capture_reset();
         capture_add(x, y, z);
         saw_motion = true;
@@ -266,31 +273,25 @@ static void do_record_wait(void) {
         Serial.println(F("..."));
 
         go_to(ST_RECORD_CAPTURE);
-        // Keep saw_motion = true (set above, go_to resets it but we set after)
         saw_motion = true;
     }
 }
 
 // =============================================================
-// STATE: RECORD_CAPTURE — Recording gesture data
+// RECORD_CAPTURE
 // =============================================================
 static void do_record_capture(void) {
     if (check_cancel()) return;
 
     unsigned long now = millis();
-
-    // Sampling rate limiter
     if (now - last_sample_ms < SAMPLE_RATE_MS) return;
     last_sample_ms = now;
 
-    // Animate
     anim_tick++;
     neo_capturing_tick(COLOR_PURPLE, gesture_idx, anim_tick);
 
-    // Read sample
     int16_t x, y, z;
     read_accel_raw(x, y, z);
-
     bool moving = is_moving_raw(x, y, z);
 
     if (moving) {
@@ -298,22 +299,24 @@ static void do_record_capture(void) {
         last_motion_ms = now;
         saw_motion = true;
     } else {
-        // Still add samples during brief pauses (part of the number shape)
         capture_add(x, y, z);
 
-        // Check if stillness has lasted long enough to end gesture
         if (saw_motion && (now - last_motion_ms > STILLNESS_MS)) {
-            // Gesture done — finalize
             if (!capture_valid()) {
                 Serial.println(F("  Too short! Try again."));
                 neo_flash(COLOR_ORANGE, 200);
-                go_to(ST_RECORD_WAIT);
-                neo_waiting_pulse(COLOR_PURPLE, gesture_idx);
+                start_countdown(MODE_RECORD);
                 return;
             }
 
+            // Dump raw data for debugging
+            capture_dump_serial();
+
             GestureBins bins = capture_finalize();
             stored_key[gesture_idx] = bins;
+
+            // Dump bins
+            bins_dump_serial(&bins, gesture_idx);
 
             gesture_idx++;
             Serial.print(F("  Gesture "));
@@ -321,79 +324,59 @@ static void do_record_capture(void) {
             Serial.println(F(" of 3 recorded."));
 
             if (gesture_idx >= NUM_GESTURES) {
-                // All 3 recorded — save to EEPROM
                 storage_save(stored_key);
                 key_exists = true;
-
                 Serial.println(F(""));
                 Serial.println(F("*** KEY SAVED TO EEPROM ***"));
                 Serial.println(F(""));
-
                 neo_show_progress(NUM_GESTURES, COLOR_PURPLE);
                 _delay_ms(300);
                 neo_saved_animation();
                 neo_idle_indicator();
                 go_to(ST_IDLE);
             } else {
-                // More gestures to record
                 neo_show_progress(gesture_idx, COLOR_PURPLE);
-                _delay_ms(500);  // Brief pause between gestures
-
-                Serial.print(F("Waiting for gesture "));
-                Serial.print(gesture_idx + 1);
-                Serial.println(F(" of 3..."));
-
-                go_to(ST_RECORD_WAIT);
-                neo_waiting_pulse(COLOR_PURPLE, gesture_idx);
+                Serial.println(F("  Reposition your hand..."));
+                start_countdown(MODE_RECORD);
             }
             return;
         }
     }
 
-    // Safety: buffer full → force finalize
     if (raw_count >= MAX_SAMPLES) {
-        Serial.println(F("  (buffer full, finalizing)"));
+        Serial.println(F("  (buffer full)"));
         if (!capture_valid()) {
             neo_flash(COLOR_ORANGE, 200);
-            go_to(ST_RECORD_WAIT);
+            start_countdown(MODE_RECORD);
             return;
         }
 
+        capture_dump_serial();
         GestureBins bins = capture_finalize();
         stored_key[gesture_idx] = bins;
+        bins_dump_serial(&bins, gesture_idx);
         gesture_idx++;
-
-        Serial.print(F("  Gesture "));
-        Serial.print(gesture_idx);
-        Serial.println(F(" of 3 recorded."));
 
         if (gesture_idx >= NUM_GESTURES) {
             storage_save(stored_key);
             key_exists = true;
             Serial.println(F("*** KEY SAVED TO EEPROM ***"));
-            neo_show_progress(NUM_GESTURES, COLOR_PURPLE);
-            _delay_ms(300);
             neo_saved_animation();
             neo_idle_indicator();
             go_to(ST_IDLE);
         } else {
             neo_show_progress(gesture_idx, COLOR_PURPLE);
-            _delay_ms(500);
-            Serial.print(F("Waiting for gesture "));
-            Serial.print(gesture_idx + 1);
-            Serial.println(F(" of 3..."));
-            go_to(ST_RECORD_WAIT);
+            start_countdown(MODE_RECORD);
         }
     }
 }
 
 // =============================================================
-// STATE: UNLOCK_WAIT — Waiting for motion to start a gesture
+// UNLOCK_WAIT
 // =============================================================
 static void do_unlock_wait(void) {
     if (check_cancel()) return;
 
-    // Timeout
     if (millis() - state_enter_time > GESTURE_TIMEOUT_MS) {
         Serial.println(F("Timeout. Returning to idle."));
         neo_flash(COLOR_ORANGE, 300);
@@ -402,14 +385,12 @@ static void do_unlock_wait(void) {
         return;
     }
 
-    // Blink waiting indicator
-    if ((millis() / 500) % 2 == 0) {
+    if ((millis() / 400) % 2 == 0) {
         neo_waiting_pulse(COLOR_YELLOW, gesture_idx);
     } else {
         neo_show_progress(gesture_idx, COLOR_GREEN);
     }
 
-    // Check for motion
     int16_t x, y, z;
     read_accel_raw(x, y, z);
 
@@ -430,13 +411,12 @@ static void do_unlock_wait(void) {
 }
 
 // =============================================================
-// STATE: UNLOCK_CAPTURE — Capturing and comparing gesture
+// UNLOCK_CAPTURE
 // =============================================================
 static void do_unlock_capture(void) {
     if (check_cancel()) return;
 
     unsigned long now = millis();
-
     if (now - last_sample_ms < SAMPLE_RATE_MS) return;
     last_sample_ms = now;
 
@@ -445,7 +425,6 @@ static void do_unlock_capture(void) {
 
     int16_t x, y, z;
     read_accel_raw(x, y, z);
-
     bool moving = is_moving_raw(x, y, z);
 
     if (moving) {
@@ -459,13 +438,16 @@ static void do_unlock_capture(void) {
             if (!capture_valid()) {
                 Serial.println(F("  Too short! Try again."));
                 neo_flash(COLOR_ORANGE, 200);
-                go_to(ST_UNLOCK_WAIT);
-                neo_waiting_pulse(COLOR_YELLOW, gesture_idx);
+                start_countdown(MODE_UNLOCK);
                 return;
             }
 
-            // Finalize and compare
+            // Dump raw data
+            capture_dump_serial();
+
             GestureBins attempt = capture_finalize();
+            bins_dump_serial(&attempt, gesture_idx);
+
             float dist = gesture_distance(&attempt, &stored_key[gesture_idx]);
 
             Serial.print(F("  Gesture "));
@@ -476,28 +458,21 @@ static void do_unlock_capture(void) {
             Serial.print(MATCH_THRESHOLD, 3);
 
             if (gesture_matches(&attempt, &stored_key[gesture_idx])) {
-                Serial.println(F("  → MATCH"));
+                Serial.println(F("  -> MATCH!"));
                 gesture_idx++;
 
                 if (gesture_idx >= NUM_GESTURES) {
-                    // ALL MATCHED — UNLOCKED
                     Serial.println(F(""));
                     Serial.println(F("***** UNLOCKED! *****"));
                     Serial.println(F(""));
                     go_to(ST_UNLOCKED);
                 } else {
                     neo_show_progress(gesture_idx, COLOR_GREEN);
-                    _delay_ms(500);
-
-                    Serial.print(F("Waiting for gesture "));
-                    Serial.print(gesture_idx + 1);
-                    Serial.println(F(" of 3..."));
-
-                    go_to(ST_UNLOCK_WAIT);
-                    neo_waiting_pulse(COLOR_YELLOW, gesture_idx);
+                    Serial.println(F("  Reposition..."));
+                    start_countdown(MODE_UNLOCK);
                 }
             } else {
-                Serial.println(F("  → NO MATCH"));
+                Serial.println(F("  -> NO MATCH"));
                 Serial.println(F(""));
                 go_to(ST_FAILED);
             }
@@ -505,40 +480,40 @@ static void do_unlock_capture(void) {
         }
     }
 
-    // Buffer full → force compare
     if (raw_count >= MAX_SAMPLES) {
-        Serial.println(F("  (buffer full, comparing)"));
+        Serial.println(F("  (buffer full)"));
         if (!capture_valid()) {
             neo_flash(COLOR_ORANGE, 200);
-            go_to(ST_UNLOCK_WAIT);
+            start_countdown(MODE_UNLOCK);
             return;
         }
 
+        capture_dump_serial();
         GestureBins attempt = capture_finalize();
+        bins_dump_serial(&attempt, gesture_idx);
         float dist = gesture_distance(&attempt, &stored_key[gesture_idx]);
 
         Serial.print(F("  Distance: "));
         Serial.println(dist, 3);
 
         if (gesture_matches(&attempt, &stored_key[gesture_idx])) {
-            Serial.println(F("  → MATCH"));
+            Serial.println(F("  -> MATCH!"));
             gesture_idx++;
             if (gesture_idx >= NUM_GESTURES) {
                 go_to(ST_UNLOCKED);
             } else {
                 neo_show_progress(gesture_idx, COLOR_GREEN);
-                _delay_ms(500);
-                go_to(ST_UNLOCK_WAIT);
+                start_countdown(MODE_UNLOCK);
             }
         } else {
-            Serial.println(F("  → NO MATCH"));
+            Serial.println(F("  -> NO MATCH"));
             go_to(ST_FAILED);
         }
     }
 }
 
 // =============================================================
-// STATE: UNLOCKED — Success!
+// UNLOCKED / FAILED
 // =============================================================
 static void do_unlocked(void) {
     neo_success_animation();
@@ -548,9 +523,6 @@ static void do_unlocked(void) {
     go_to(ST_IDLE);
 }
 
-// =============================================================
-// STATE: FAILED — Wrong gesture
-// =============================================================
 static void do_failed(void) {
     neo_fail_animation();
     Serial.println(F("Unlock failed. Press RIGHT to try again."));
@@ -565,6 +537,7 @@ static void do_failed(void) {
 void loop() {
     switch (state) {
         case ST_IDLE:           do_idle();              break;
+        case ST_COUNTDOWN:      do_countdown();         break;
         case ST_RECORD_WAIT:    do_record_wait();       break;
         case ST_RECORD_CAPTURE: do_record_capture();    break;
         case ST_UNLOCK_WAIT:    do_unlock_wait();       break;

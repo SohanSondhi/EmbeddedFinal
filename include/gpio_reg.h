@@ -189,7 +189,8 @@ static void neo_show(void) {
         neo_send_byte(pixel_buf[i].b);
     }
     sei();  // Re-enable interrupts
-    _delay_us(80);  // Latch / reset pulse
+    _delay_us(80); 
+    NEO_PORT |= (1 << NEO_BIT); // Latch / reset pulse
 }
 
 // =============================================================
