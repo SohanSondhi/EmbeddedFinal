@@ -1,45 +1,28 @@
 # CLAUDE.md — KinetiKey Project Context
 
-**Read this first before doing anything. This is the full project history and current state.**
+**Read this first before doing anything.**
 
 ---
 
 ## Project Overview
 
-**KinetiKey** — "Old Lock, New Twist"
-Embedded Challenge Spring 2026 term project.
-
-A gesture-based combination lock. User holds the board in their fist, performs 3 gestures to record a "key", then replicates the same 3 gestures to unlock. Like a combination padlock but with physical motions instead of numbers.
+**KinetiKey** — Gesture-based combination lock.
+Embedded Challenge Spring 2026. Hold board in fist, perform 3 gestures to record a key, replicate to unlock.
 
 ## Hardware
 
-- **Board**: Adafruit Circuit Playground Classic
-- **MCU**: ATmega32u4 @ **8MHz** (NOT 16MHz — this matters for NeoPixel timing)
-- **Accelerometer**: LIS3DH, connected via **SPI** (NOT I2C), CS = pin 8
-- **NeoPixels**: 10x WS2812B on pin 8 (**shared with LIS3DH SPI CS** — this is the root of the NeoPixel bug)
-- **Buttons**: Left (#4, PD4), Right (#19, PF6) — **ACTIVE HIGH** (board has external pull-downs)
+- **Board**: Adafruit Circuit Playground Classic (ATmega32u4 @ 8MHz)
+- **Accelerometer**: LIS3DH via SPI (managed by CircuitPlayground library)
+- **NeoPixels**: 10x WS2812B on pin 8 (managed by CircuitPlayground library)
+- **Buttons**: Left (#4, PD4), Right (#19, PF6) — ACTIVE HIGH (external pull-downs)
 - **Red LED**: #13 (PC7)
-- **No external wiring** — everything is onboard
+- Pin 8 shared between NeoPixel data and LIS3DH SPI CS — CircuitPlayground library handles this internally
 
-## Project Requirements (from professor)
+## Team & Repo
 
-- Record a 3-gesture sequence using accelerometer data
-- Store sequence on microcontroller (EEPROM)
-- User replicates gestures within tolerances to unlock
-- Each successful gesture indicated by LEDs
-- Successful unlock shown by visual indicator
-- Must use PlatformIO
-- Only the onboard accelerometer allowed
-- **GPIO must use register-level access** (no `digitalWrite`, `digitalRead`, `pinMode`)
-- Allowed to use Adafruit LIS3DH library for sensor communication
-- Allowed to use Arduino framework functions (`millis()`, `Serial`, `SPI`)
-
-## Team
-
-- GitHub repo: `SohanSondhi/EmbeddedFinal`
+- GitHub: `SohanSondhi/EmbeddedFinal`
 - Branch workflow: feature branches → PR → merge to main
-- Sichen (SichenLiang) is primary developer
-- Two other teammates
+- Sichen (SichenLiang) primary developer, 2 teammates
 
 ## Build & Upload
 
@@ -47,170 +30,134 @@ A gesture-based combination lock. User holds the board in their fist, performs 3
 cd ~/EmbeddedFinal
 pio run
 
-# Upload often fails with auto-reset. Manual method:
-# 1. Double-click RESET button on board (red LED pulses = bootloader mode)
+# Manual upload (auto-reset unreliable):
+# 1. Double-click RESET (red LED pulses = bootloader)
 # 2. Immediately run:
 ~/.platformio/packages/tool-avrdude/bin/avrdude \
   -p atmega32u4 -c avr109 \
   -C ~/.platformio/packages/tool-avrdude/avrdude.conf \
-  -P /dev/cu.usbmodem1101 \
+  -P /dev/cu.usbmodem101 \
   -U flash:w:.pio/build/cpclassic/firmware.hex:i
 
-# Serial monitor:
-pio device monitor
+# Port may vary — check: ls /dev/cu.usbmodem*
+pio device monitor  # 9600 baud
 ```
-
-The `platformio.ini` uses `board = circuitplay_classic` (NOT `adafruit_circuitplayground_classic` which doesn't exist in PlatformIO).
-
----
 
 ## File Structure
 
 ```
-├── platformio.ini
+├── platformio.ini          # CircuitPlayground library only
 ├── README.md
-├── CLAUDE.md              ← YOU ARE HERE
+├── CLAUDE.md               ← YOU ARE HERE
 ├── include/
-│   ├── pin_config.h       ← All tunable constants, pin definitions
-│   ├── gpio_reg.h         ← Register-level GPIO, NeoPixel bit-bang, LED animations
-│   ├── gesture.h          ← Gesture capture, feature extraction, matching algorithm
-│   └── storage.h          ← EEPROM save/load with magic number + checksum
+│   ├── pin_config.h        # Constants, thresholds, pin defs
+│   ├── gpio_reg.h          # NeoPixel (via CircuitPlayground.strip) + register-level GPIO
+│   ├── gesture.h           # DTW on normalized magnitude
+│   └── storage.h           # EEPROM save/load with checksum
 └── src/
-    └── main.cpp           ← State machine, button handling, record/unlock flow
+    └── main.cpp            # State machine, record/unlock/retry flow
 ```
 
-## Current State (as of latest push)
+## Algorithm: DTW on Normalized Magnitude (V7.2)
 
-### What Works
-- **LIS3DH accelerometer**: Reading via SPI using Adafruit library ✅
-- **Buttons**: Register-level reading, debounced, active-high ✅
-- **Red LED (#13)**: Register-level toggle ✅
-- **State machine**: Full record/unlock/erase/cancel flow ✅
-- **EEPROM storage**: Save/load with checksum, survives power cycles ✅
-- **Gesture capture**: Raw sample recording at 50Hz ✅
-- **Serial debug output**: Raw data CSV, feature vectors, distance values ✅
-- **Long-press erase**: Hold left button 3 seconds to erase key ✅
-- **Cancel**: Both buttons to cancel any operation ✅
+**Pipeline:**
+1. Capture raw int16_t XYZ at 50Hz (up to 100 samples)
+2. Downsample to 30 points (evenly spaced)
+3. Compute magnitude: `sqrt(x² + y² + z²)` for each point
+4. Normalize: subtract mean, divide by std dev → zero-mean unit-variance
+5. Compare via banded DTW (Sakoe-Chiba band=8, rolling 2-row = 248 bytes)
+6. DTW cost / N < threshold → match
 
-### What Does NOT Work — KNOWN BUGS
+**Why this works:**
+- Magnitude is a scalar → orientation invariant (doesn't matter how you hold the board)
+- Normalization removes scale → big/small gestures match
+- DTW warps time → fast/slow versions of same gesture match
 
-#### 1. NeoPixels DO NOT LIGHT UP (Critical)
-**Only the #13 red LED works. All 10 NeoPixels remain dark.**
+**Known limitation:** Extreme orientation changes (e.g., fully horizontal → fully vertical) still affect magnitude because gravity contributes differently. Fix: subtract gravity before normalization (`mag - 8192`). Not yet implemented.
 
-Root cause: Pin 8 (PB4) is shared between NeoPixel data line and LIS3DH SPI chip select. When the SPI peripheral is active, it interferes with bit-banging NeoPixel data on the same pin.
+**Threshold:** `MATCH_THRESHOLD = 0.7` (normalized units). Correct gestures typically 0.15-0.5, wrong gestures 0.8+.
 
-**What we tried:**
-- 16MHz NeoPixel timing → wrong, board is 8MHz
-- 8MHz timing with various NOP counts → still no light
-- Adafruit-style 8MHz assembly (sbrc/rjmp trick, 10 cycles/bit) → still no light
-- Disabling SPI (`SPCR = 0`) before NeoPixel transmission, re-enabling after → still no light
+## NeoPixels
 
-**What to try next:**
-- Look at the actual Adafruit CircuitPlayground library source code to see exactly how they handle the shared pin 8 between NeoPixels and LIS3DH SPI
-- Possibly need to fully deinit SPI, not just clear SPCR (may need to reset pin directions for MOSI/SCK/MISO)
-- Possibly need to use the Adafruit_CPlay_NeoPixel library directly (but this uses `digitalWrite` internally which violates GPIO register requirement — may need to extract their approach)
-- Consider using `Adafruit_NeoPixel` library for just the NeoPixel communication (it does its own bit-bang with proven timing) and argue that it's a "driver" like the LIS3DH library
+**Solution:** `Adafruit_CircuitPlayground` library. This is the official library for this exact board. It handles:
+- Pin 8 SPI/NeoPixel sharing (disables SPI before data transmission)
+- 8MHz bit-bang timing
+- 74AHCT125 level shifter (3.3V → 5V for NeoPixel data)
 
-#### 2. Gesture Recognition — Accuracy Inconsistent
-**The matching algorithm works in concept but is fragile in practice.**
+All NeoPixel operations go through `CircuitPlayground.strip`. Our wrapper functions (`neo_show()`, `neo_set()`, etc.) call the library internally.
 
-**Algorithm versions attempted:**
-
-1. **V1 — Raw acceleration binning** (first attempt)
-   - Binned raw XYZ acceleration into 10 time bins
-   - Per-axis normalization (zero mean, unit variance)
-   - RESULT: Per-axis normalization destroyed inter-axis relationships. All gestures looked identical after normalization. Random circles matched as well as correct gestures.
-
-2. **V2 — Global energy normalization** (fixed V1's normalization)
-   - Same binning but normalize all axes by ONE shared energy value
-   - Preserves axis ratios (shape)
-   - RESULT: Worked! Correct gestures: distance 0.6-0.75. Wrong gestures: 1.35+. Threshold 1.0 separated them cleanly.
-   - PROBLEM: Only worked when user held board in same orientation. Different grip = different XYZ values = no match, even for same gesture.
-
-3. **V3 — Position tracking (double integration)**
-   - Accel → velocity → position via double integration
-   - Detrending to remove drift
-   - RESULT: Double integration amplified small errors. Same gesture produced wildly different position paths. Inconsistent.
-
-4. **V4 — Velocity tracking (single integration)**
-   - Accel → velocity via single integration
-   - Detrending + interpolation resampling
-   - RESULT: Still orientation-dependent. Same fundamental problem as V2 — different grip orientation = different axis values.
-
-5. **V5 — Orientation-invariant features (CURRENT)**
-   - Uses scalar features that don't depend on which way axes point:
-     - **Energy**: |accel| - gravity (how hard you're moving)
-     - **Jerk**: |accel[i] - accel[i-1]| (how fast direction changes)
-   - Trims stationary tails, only processes active motion
-   - Interpolation resampling to 20 points
-   - Per-feature normalization to [0, 1]
-   - RESULT: Most promising so far. Correct gesture 1 matched at 0.203 distance. But still inconsistent — same gesture sometimes 0.2, sometimes 0.6. Threshold at 0.45 is borderline.
-
-**Current threshold**: `MATCH_THRESHOLD 0.45f` in `pin_config.h`
-
-**Recommendation for next session:**
-- Increase threshold to 0.55 for more forgiveness
-- Test with **simple, distinct gestures** (punch forward, shake left-right, knock up-down) instead of drawing numbers — drawing produces very inconsistent acceleration patterns
-- Consider combining V5 features with additional features like total gesture duration, number of zero-crossings, dominant frequency
-- Consider using DTW (Dynamic Time Warping) for comparison instead of Euclidean distance — DTW handles timing variations much better but is memory-intensive
-
-### Controls
+## Controls
 
 | Action | How |
 |--------|-----|
-| Record new key | Short press LEFT button |
-| Unlock attempt | Press RIGHT button |
-| Erase stored key | Hold LEFT button for 3 seconds (red LEDs should fill up as warning) |
-| Cancel operation | Hold BOTH buttons simultaneously |
+| Record new key | Short press LEFT |
+| Unlock attempt | Press RIGHT |
+| Erase stored key | Hold LEFT 3 seconds |
+| Cancel operation | Hold BOTH buttons |
 
-### LED Behavior (intended, but NeoPixels don't work yet)
+## Retry Logic
+
+- Each gesture gets 3 attempts during unlock
+- Failed gesture → retry from THAT gesture (not from gesture 1)
+- Pass a gesture → retries reset to 3 for next gesture
+- All 3 retries exhausted on any gesture → total failure, return to idle
+
+## LED Patterns
 
 | Pattern | Meaning |
 |---------|---------|
-| Two blue dots | Idle |
-| Purple countdown → flash | Get ready → GO (record) |
-| Yellow countdown → flash | Get ready → GO (unlock) |
-| White spinning | Capturing gesture |
-| Purple progress (3 LEDs per gesture) | Recording progress |
+| Cyan sweep | Boot animation |
+| Two blue dots | Idle, ready |
+| Purple countdown | Recording countdown |
+| Yellow countdown | Unlock countdown |
+| White spinning dot | Capturing gesture |
+| Purple progress (3 LEDs/gesture) | Recording progress |
 | Green progress | Unlock progress |
-| Green chase → solid 3s | UNLOCKED |
+| Green chase → solid → fade | UNLOCKED |
 | Red flash ×5 | FAILED |
-| Orange flash ×2 | No key / timeout |
+| Orange flash | Warning (too short, timeout, retry) |
 | Red progressive fill | Erase countdown |
 
-Currently only the #13 red LED blinks for fail/success.
+## Key Constants (pin_config.h)
 
-### Serial Monitor Output
+| Constant | Value | Purpose |
+|----------|-------|---------|
+| `MATCH_THRESHOLD` | 0.7 | DTW distance cutoff |
+| `MAX_RETRIES` | 3 | Attempts per gesture |
+| `DTW_SAMPLES` | 30 | Downsampled points |
+| `DTW_BAND` | 8 | Sakoe-Chiba band width |
+| `STILLNESS_MS` | 500 | Still = gesture done |
+| `RAW_MOTION_THR` | 1500 | Motion detection sensitivity |
+| `COUNTDOWN_MS` | 2000 | LED countdown duration |
+| `ERASE_HOLD_MS` | 3000 | Long-press to erase |
 
-At 9600 baud, shows:
-- State transitions
-- Raw accelerometer CSV data per gesture (can paste into visualizer)
-- Feature vectors (energy + jerk values at each resampled point)
-- Distance values and match/no-match results
-- Active region detection (trimmed samples)
+## EEPROM Layout
 
-### Key Constants to Tune (in pin_config.h)
+- Byte 0: Magic (0xAB)
+- Byte 1: XOR checksum
+- Bytes 2+: 3 × GestureBins (180 bytes each = 540 total)
+- Total: 542 / 1024 bytes
 
-- `MATCH_THRESHOLD` — Most important. Currently 0.45. Higher = more forgiving.
-- `STILLNESS_MS` — 600ms. How long still before gesture ends.
-- `RAW_MOTION_THR` — 1500. Motion detection sensitivity.
-- `NUM_PATH_PTS` — 20. Feature resolution.
-- `ERASE_HOLD_MS` — 3000. Long-press duration for erase.
+## Memory Usage
 
-### Gesture Visualizer
+- Flash: ~84% (24K / 28K)
+- RAM: ~63% (1610 / 2560 bytes)
+- DTW computation uses ~488 bytes stack (temporary)
 
-A React JSX file (`gesture_visualizer.jsx`) exists that can plot gesture data. Paste Serial Monitor output to see XYZ acceleration curves. Note: this shows raw acceleration, not the processed features.
+## What Still Needs Work
 
----
+1. **Gravity subtraction** — subtract 8192 from magnitude before normalization for better orientation invariance
+2. **Threshold tuning** — collect more data, find optimal value
+3. **Video demo** — required for grading
+4. **Code comments** — add inline documentation for grading
 
-## What Needs to Be Done
+## Project Requirements Compliance
 
-1. **Fix NeoPixels** — The #1 priority. Without visual feedback, the project loses significant grading points (LED feedback is explicitly required). Study the Adafruit CircuitPlayground library source to understand how they handle the pin 8 sharing.
-
-2. **Stabilize gesture matching** — Test with simple gestures (punch, shake, knock), tune threshold. May need to add more features or switch to DTW.
-
-3. **Video demo** — Required for grading. Should show: record 3 gestures, successful unlock, failed unlock with wrong gestures.
-
-4. **Code cleanup** — Comments, remove debug prints for final version, ensure all GPIO is register-level.
-
-5. **Push final version** — Commit and merge to main.
+- ✅ PlatformIO
+- ✅ Register-level GPIO for buttons and LED (DDRx, PORTx, PINx)
+- ✅ Onboard accelerometer only
+- ✅ Adafruit library for sensor communication (allowed by professor)
+- ✅ CircuitPlayground library for NeoPixels (same category as sensor library — HAL/driver)
+- ✅ EEPROM storage survives power cycles
+- ✅ LED feedback for all states
+- ✅ 3-gesture sequence record and replay
