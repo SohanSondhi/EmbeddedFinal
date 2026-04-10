@@ -6,38 +6,23 @@
 #include "pin_config.h"
 
 // =============================================================
-// Gesture Engine V5 — Orientation-Invariant Matching
+// Gesture Engine V7.2 — DTW on Normalized Magnitude
 //
-// PROBLEM WITH V1-V4: Gestures use X, Y, Z axis values, but the
-// user holds the board in different orientations each time. Same
-// physical motion → totally different X/Y/Z data → no match.
+// V7.1 compared raw magnitudes. PROBLEM: drawing bigger = higher
+// magnitudes → same gesture at different sizes fails.
 //
-// SOLUTION: Use features that DON'T depend on orientation.
-//
-// Feature 1: ENERGY = |accel| - gravity
-//   = how hard you're moving, regardless of direction
-//   Drawing "1" (one stroke) → one peak
-//   Drawing "3" (two curves) → two peaks
-//
-// Feature 2: JERK = |accel[i] - accel[i-1]|
-//   = how quickly you change direction
-//   Straight stroke → low jerk
-//   Sharp turn → high jerk spike
-//
-// Both features are SCALAR (not vector) → orientation invariant.
-//
-// Pipeline:
-//   1. Capture raw samples
-//   2. Compute energy & jerk for each sample
-//   3. Trim stationary tails (only keep active motion)
-//   4. Resample trimmed profiles to NUM_PATH_PTS points
-//   5. Normalize each feature to [0, 1]
-//   6. Compare via Euclidean distance
+// V7.2: Before running DTW, compute magnitude sequence for both
+// gestures, then NORMALIZE (subtract mean, divide by std dev).
+// This makes comparison invariant to:
+//   - Orientation (magnitude is scalar)
+//   - Size/force (normalization removes scale)
+//   - Speed (DTW handles time warping)
 // =============================================================
 
 struct GestureBins {
-    float energy[NUM_PATH_PTS];
-    float jerk[NUM_PATH_PTS];
+    int16_t x[DTW_SAMPLES];
+    int16_t y[DTW_SAMPLES];
+    int16_t z[DTW_SAMPLES];
 };
 
 struct RawSample { int16_t x, y, z; };
@@ -58,181 +43,127 @@ static bool capture_add(int16_t x, int16_t y, int16_t z) {
 static bool capture_valid(void) { return raw_count >= MIN_SAMPLES; }
 
 static void capture_dump_serial(void) {
-    Serial.println(F("--- RAW DATA START ---"));
-    Serial.println(F("i,x,y,z"));
+    Serial.println(F("--- RAW START ---"));
     for (uint16_t i = 0; i < raw_count; i++) {
-        Serial.print(i); Serial.print(F(","));
-        Serial.print(raw_buf[i].x); Serial.print(F(","));
-        Serial.print(raw_buf[i].y); Serial.print(F(","));
+        Serial.print(i); Serial.print(',');
+        Serial.print(raw_buf[i].x); Serial.print(',');
+        Serial.print(raw_buf[i].y); Serial.print(',');
         Serial.println(raw_buf[i].z);
     }
-    Serial.println(F("--- RAW DATA END ---"));
+    Serial.println(F("--- RAW END ---"));
 }
 
-// =============================================================
-// Compute magnitude of a raw sample
-// =============================================================
-static float raw_mag(uint16_t i) {
-    float x = raw_buf[i].x, y = raw_buf[i].y, z = raw_buf[i].z;
-    return sqrt(x * x + y * y + z * z);
-}
-
-// =============================================================
-// Compute jerk magnitude between consecutive samples
-// =============================================================
-static float raw_jerk(uint16_t i) {
-    if (i == 0) return 0;
-    float dx = raw_buf[i].x - raw_buf[i - 1].x;
-    float dy = raw_buf[i].y - raw_buf[i - 1].y;
-    float dz = raw_buf[i].z - raw_buf[i - 1].z;
-    return sqrt(dx * dx + dy * dy + dz * dz);
-}
-
-// =============================================================
-// Find active region (trim stationary tails)
-// Returns start and end indices of motion
-// =============================================================
-static void find_active_region(uint16_t *start, uint16_t *end) {
-    // Compute mean magnitude (≈ gravity at rest)
-    float mean_mag = 0;
-    for (uint16_t i = 0; i < raw_count; i++) mean_mag += raw_mag(i);
-    mean_mag /= raw_count;
-
-    float threshold = 800.0f;  // min deviation from gravity to count as moving
-
-    // Find first sample with significant motion
-    *start = 0;
-    for (uint16_t i = 0; i < raw_count; i++) {
-        if (fabs(raw_mag(i) - mean_mag) > threshold || raw_jerk(i) > threshold) {
-            *start = (i > 2) ? i - 2 : 0;  // include 2 samples before
-            break;
-        }
+// Downsample raw_buf to DTW_SAMPLES points
+static GestureBins downsample(void) {
+    GestureBins g;
+    memset(&g, 0, sizeof(g));
+    if (raw_count == 0) return g;
+    for (uint8_t i = 0; i < DTW_SAMPLES; i++) {
+        uint16_t idx = (uint16_t)((uint32_t)i * (raw_count - 1) / (DTW_SAMPLES - 1));
+        if (idx >= raw_count) idx = raw_count - 1;
+        g.x[i] = raw_buf[idx].x;
+        g.y[i] = raw_buf[idx].y;
+        g.z[i] = raw_buf[idx].z;
     }
-
-    // Find last sample with significant motion
-    *end = raw_count - 1;
-    for (uint16_t i = raw_count - 1; i > *start; i--) {
-        if (fabs(raw_mag(i) - mean_mag) > threshold || raw_jerk(i) > threshold) {
-            *end = (i + 3 < raw_count) ? i + 2 : raw_count - 1;
-            break;
-        }
-    }
-
-    // Ensure minimum length
-    if (*end - *start < MIN_SAMPLES) {
-        *start = 0;
-        *end = raw_count - 1;
-    }
-}
-
-// =============================================================
-// Build feature profiles and resample to NUM_PATH_PTS points
-// =============================================================
-
-static GestureBins capture_extract(void) {
-    GestureBins result;
-    memset(&result, 0, sizeof(result));
-    if (raw_count < MIN_SAMPLES) return result;
-
-    // Find active region
-    uint16_t start, end;
-    find_active_region(&start, &end);
-    uint16_t active_len = end - start + 1;
-
-    Serial.print(F("  Active region: ")); Serial.print(start);
-    Serial.print(F("-")); Serial.print(end);
-    Serial.print(F(" (")); Serial.print(active_len); Serial.println(F(" samples)"));
-
-    // Compute mean magnitude over active region (gravity baseline)
-    float mean_mag = 0;
-    for (uint16_t i = start; i <= end; i++) mean_mag += raw_mag(i);
-    mean_mag /= active_len;
-
-    // Resample energy and jerk to NUM_PATH_PTS using linear interpolation
-    for (uint8_t p = 0; p < NUM_PATH_PTS; p++) {
-        // Map output point p to input sample index (float)
-        float t = (float)p / (NUM_PATH_PTS - 1) * (active_len - 1) + start;
-        uint16_t lo = (uint16_t)t;
-        uint16_t hi = lo + 1;
-        if (hi > end) hi = end;
-        float frac = t - lo;
-
-        // Interpolated energy
-        float e_lo = fabs(raw_mag(lo) - mean_mag);
-        float e_hi = fabs(raw_mag(hi) - mean_mag);
-        result.energy[p] = e_lo + frac * (e_hi - e_lo);
-
-        // Interpolated jerk
-        float j_lo = raw_jerk(lo);
-        float j_hi = raw_jerk(hi);
-        result.jerk[p] = j_lo + frac * (j_hi - j_lo);
-    }
-
-    return result;
-}
-
-// =============================================================
-// Normalize each feature to [0, 1]
-// =============================================================
-
-static void normalize_features(GestureBins *g) {
-    float max_e = 0.001f, max_j = 0.001f;
-
-    for (uint8_t i = 0; i < NUM_PATH_PTS; i++) {
-        if (g->energy[i] > max_e) max_e = g->energy[i];
-        if (g->jerk[i] > max_j) max_j = g->jerk[i];
-    }
-
-    for (uint8_t i = 0; i < NUM_PATH_PTS; i++) {
-        g->energy[i] /= max_e;
-        g->jerk[i] /= max_j;
-    }
-}
-
-// =============================================================
-// Debug print
-// =============================================================
-static void bins_dump_serial(const GestureBins *g, uint8_t gnum) {
-    Serial.print(F("  [Features G")); Serial.print(gnum + 1); Serial.println(F("]"));
-    for (uint8_t i = 0; i < NUM_PATH_PTS; i++) {
-        Serial.print(F("    ")); Serial.print(i);
-        Serial.print(F(": e=")); Serial.print(g->energy[i], 3);
-        Serial.print(F(" j=")); Serial.println(g->jerk[i], 3);
-    }
-}
-
-// =============================================================
-// Distance: Euclidean between normalized feature profiles
-// =============================================================
-
-static float gesture_distance(const GestureBins *a, const GestureBins *b) {
-    float dist = 0;
-    for (uint8_t i = 0; i < NUM_PATH_PTS; i++) {
-        float de = a->energy[i] - b->energy[i];
-        float dj = a->jerk[i] - b->jerk[i];
-        dist += de * de + dj * dj;
-    }
-    return sqrt(dist / NUM_PATH_PTS);
-}
-
-static bool gesture_matches(const GestureBins *attempt, const GestureBins *stored) {
-    return gesture_distance(attempt, stored) < MATCH_THRESHOLD;
-}
-
-// =============================================================
-// Full pipeline
-// =============================================================
-
-static GestureBins capture_finalize(void) {
-    GestureBins g = capture_extract();
-    normalize_features(&g);
     return g;
 }
 
 // =============================================================
-// Motion detection
+// Compute magnitude sequence and normalize (zero mean, unit std)
 // =============================================================
+static void compute_normalized_mags(const GestureBins *g, float *mags) {
+    // Step 1: compute raw magnitudes
+    for (uint8_t i = 0; i < DTW_SAMPLES; i++) {
+        mags[i] = sqrt((float)g->x[i] * g->x[i] +
+                        (float)g->y[i] * g->y[i] +
+                        (float)g->z[i] * g->z[i]);
+    }
 
+    // Step 2: compute mean
+    float mean = 0;
+    for (uint8_t i = 0; i < DTW_SAMPLES; i++) mean += mags[i];
+    mean /= DTW_SAMPLES;
+
+    // Step 3: subtract mean
+    for (uint8_t i = 0; i < DTW_SAMPLES; i++) mags[i] -= mean;
+
+    // Step 4: compute std dev
+    float var = 0;
+    for (uint8_t i = 0; i < DTW_SAMPLES; i++) var += mags[i] * mags[i];
+    float std = sqrt(var / DTW_SAMPLES);
+
+    // Step 5: divide by std (avoid div by zero)
+    if (std > 0.01f) {
+        for (uint8_t i = 0; i < DTW_SAMPLES; i++) mags[i] /= std;
+    }
+}
+
+// =============================================================
+// Banded DTW on normalized magnitude sequences
+// =============================================================
+static float dtw_on_mags(const float *a, const float *b) {
+    uint8_t N = DTW_SAMPLES;
+    float prev[DTW_SAMPLES + 1];
+    float curr[DTW_SAMPLES + 1];
+
+    for (uint8_t j = 0; j <= N; j++) prev[j] = 1e9f;
+    prev[0] = 0;
+
+    for (uint8_t i = 1; i <= N; i++) {
+        for (uint8_t j = 0; j <= N; j++) curr[j] = 1e9f;
+
+        uint8_t j_start = (i > DTW_BAND) ? (i - DTW_BAND) : 1;
+        uint8_t j_end   = (i + DTW_BAND < N) ? (i + DTW_BAND) : N;
+
+        for (uint8_t j = j_start; j <= j_end; j++) {
+            float cost = fabs(a[i - 1] - b[j - 1]);
+
+            float m = prev[j - 1];
+            if (prev[j] < m) m = prev[j];
+            if (curr[j - 1] < m) m = curr[j - 1];
+
+            curr[j] = cost + m;
+        }
+
+        for (uint8_t j = 0; j <= N; j++) prev[j] = curr[j];
+    }
+
+    return prev[N] / N;
+}
+
+// =============================================================
+// Public interface: compute distance between two stored gestures
+// =============================================================
+static float gesture_distance(const GestureBins *a, const GestureBins *b) {
+    float mags_a[DTW_SAMPLES];
+    float mags_b[DTW_SAMPLES];
+    compute_normalized_mags(a, mags_a);
+    compute_normalized_mags(b, mags_b);
+    return dtw_on_mags(mags_a, mags_b);
+}
+
+static bool gesture_matches(const GestureBins *a, const GestureBins *b) {
+    return gesture_distance(a, b) < MATCH_THRESHOLD;
+}
+
+// Full pipeline
+static GestureBins capture_finalize(void) {
+    return downsample();
+}
+
+// Debug print with magnitudes
+static void bins_dump_serial(const GestureBins *g, uint8_t gnum) {
+    Serial.print(F("  [G")); Serial.print(gnum + 1);
+    Serial.print(F(" ")); Serial.print(DTW_SAMPLES); Serial.println(F("pts]"));
+    float mags[DTW_SAMPLES];
+    compute_normalized_mags(g, mags);
+    for (uint8_t i = 0; i < DTW_SAMPLES; i++) {
+        Serial.print(F("  ")); Serial.print(i);
+        Serial.print(F(": mag_norm=")); Serial.println(mags[i], 3);
+    }
+}
+
+// Motion detection
 static bool is_moving_raw(int16_t x, int16_t y, int16_t z) {
     float mag = sqrt((float)x * x + (float)y * y + (float)z * z);
     return fabs(mag - RAW_REST_MAG) > RAW_MOTION_THR;

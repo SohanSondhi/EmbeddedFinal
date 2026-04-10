@@ -2,7 +2,6 @@
 #define STORAGE_H
 
 #include <avr/eeprom.h>
-#include <string.h>
 #include "pin_config.h"
 #include "gesture.h"
 
@@ -26,15 +25,12 @@ static void storage_save(const GestureBins key[NUM_GESTURES]) {
 }
 
 static bool storage_load(GestureBins key[NUM_GESTURES]) {
-    if (eeprom_read_byte((const uint8_t *)EEPROM_MAGIC_ADDR) != EEPROM_MAGIC_VAL) return false;
+    if (eeprom_read_byte((const uint8_t *)EEPROM_MAGIC_ADDR) != EEPROM_MAGIC_VAL)
+        return false;
     uint8_t stored = eeprom_read_byte((const uint8_t *)EEPROM_CSUM_ADDR);
     uint16_t sz = sizeof(GestureBins) * NUM_GESTURES;
     eeprom_read_block((void *)key, (const void *)EEPROM_DATA_ADDR, sz);
     return compute_checksum(key, sz) == stored;
-}
-
-static bool storage_has_key(void) {
-    return eeprom_read_byte((const uint8_t *)EEPROM_MAGIC_ADDR) == EEPROM_MAGIC_VAL;
 }
 
 static void storage_erase(void) {
