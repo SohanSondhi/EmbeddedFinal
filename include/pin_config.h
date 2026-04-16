@@ -43,7 +43,7 @@
 // After normalization, values are in standard deviations.
 // Correct gestures should be ~0.2-0.5, wrong should be ~0.8+
 // Start at 0.7, tune after testing.
-#define MATCH_THRESHOLD 0.6f
+#define MATCH_THRESHOLD 0.65f
 
 // Retry config
 #define MAX_RETRIES     3           // attempts per gesture before total fail
