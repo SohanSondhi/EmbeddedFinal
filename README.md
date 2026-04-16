@@ -78,7 +78,9 @@ pio run
 # Upload (manual bootloader — most reliable):
 # 1. Double-click RESET on board
 # 2. Red LED pulses = bootloader mode
-# 3. Immediately run:
+# 3. Check port — it may change between 101 and 1101 each reset:
+#      ls /dev/cu.usbmodem*
+# 4. Immediately run (replace port if needed):
 ~/.platformio/packages/tool-avrdude/bin/avrdude \
   -p atmega32u4 -c avr109 \
   -C ~/.platformio/packages/tool-avrdude/avrdude.conf \
