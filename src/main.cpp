@@ -15,6 +15,7 @@ static unsigned long state_enter_time = 0, last_sample_ms = 0, last_motion_ms = 
 static bool saw_motion = false;
 static uint8_t anim_tick = 0, retries_left = MAX_RETRIES;
 
+<<<<<<< HEAD
 static void read_accel_raw(int16_t &x, int16_t &y, int16_t &z) { // reads raw accelerometer values into x, y, z
     CircuitPlayground.lis.read();
     x = CircuitPlayground.lis.x; y = CircuitPlayground.lis.y; z = CircuitPlayground.lis.z;
@@ -23,6 +24,14 @@ static void read_accel_raw(int16_t &x, int16_t &y, int16_t &z) { // reads raw ac
 static void go_to(State s) { state = s; state_enter_time = millis(); saw_motion = false; anim_tick = 0; } // state transition helper
 
 static bool check_cancel(void) { // checks if both buttons are held to cancel the current operation, returns true if cancelled
+=======
+static void read_accel_raw(int16_t &x, int16_t &y, int16_t &z) {
+    CircuitPlayground.lis.read();
+    x = CircuitPlayground.lis.x; y = CircuitPlayground.lis.y; z = CircuitPlayground.lis.z;
+}
+static void go_to(State s) { state = s; state_enter_time = millis(); saw_motion = false; anim_tick = 0; }
+static bool check_cancel(void) {
+>>>>>>> 385d66dc0fa82f78113c5138c389e2eb2c0fc774
     if (both_buttons_held()) {
         Serial.println(F("--- CANCELLED ---"));
         neo_cancel_feedback(); neo_idle_indicator(); go_to(ST_IDLE);
@@ -31,7 +40,10 @@ static bool check_cancel(void) { // checks if both buttons are held to cancel th
     }
     return false;
 }
+<<<<<<< HEAD
 
+=======
+>>>>>>> 385d66dc0fa82f78113c5138c389e2eb2c0fc774
 static bool do_countdown(void) {
     uint32_t c = (mode == MODE_RECORD) ? COLOR_PURPLE : COLOR_YELLOW;
     uint32_t pc = (mode == MODE_RECORD) ? COLOR_PURPLE : COLOR_GREEN;
@@ -50,7 +62,10 @@ static bool do_countdown(void) {
     Serial.print(F("  GO! G")); Serial.println(gesture_idx + 1);
     return true;
 }
+<<<<<<< HEAD
 
+=======
+>>>>>>> 385d66dc0fa82f78113c5138c389e2eb2c0fc774
 void setup() {
     Serial.begin(9600);
     unsigned long t0 = millis();
@@ -69,7 +84,10 @@ void setup() {
     Serial.print(F(" Retries=")); Serial.println(MAX_RETRIES);
     Serial.println(F("LEFT=Record | RIGHT=Unlock | LEFT3s=Erase | BOTH=Cancel\n"));
 }
+<<<<<<< HEAD
 
+=======
+>>>>>>> 385d66dc0fa82f78113c5138c389e2eb2c0fc774
 static void do_idle(void) {
     if (btn_left_raw()) {
         unsigned long hs = millis(); uint8_t lp = 0;
@@ -176,7 +194,10 @@ static void do_unlock_capture(void) {
 }
 static void do_unlocked(void) { neo_success_animation(); Serial.println(F("Locked. Returning to idle.\n")); neo_idle_indicator(); go_to(ST_IDLE); }
 static void do_failed(void) { neo_fail_animation(); Serial.println(F("Failed. RIGHT to retry.\n")); neo_idle_indicator(); go_to(ST_IDLE); }
+<<<<<<< HEAD
 
+=======
+>>>>>>> 385d66dc0fa82f78113c5138c389e2eb2c0fc774
 void loop() {
     switch (state) {
         case ST_IDLE: do_idle(); break; case ST_RECORD_WAIT: do_record_wait(); break;
