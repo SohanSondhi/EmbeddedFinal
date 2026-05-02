@@ -3,6 +3,8 @@
 
 #include <avr/io.h>
 
+// Variables used for pin configuration and state tracking for buttons, LEDs, NeoPixels, and other hardware components. These variables are defined here for easy reference and modification throughout the codebase.
+
 // Left Button (D4 = PD4) — ACTIVE HIGH
 #define BTN_LEFT_DDR    DDRD
 #define BTN_LEFT_PORT   PORTD
@@ -41,8 +43,6 @@
 
 // Normalized magnitude DTW threshold
 // After normalization, values are in standard deviations.
-// Correct gestures should be ~0.2-0.5, wrong should be ~0.8+
-// Start at 0.7, tune after testing.
 #define MATCH_THRESHOLD 0.65f
 
 // Retry config
