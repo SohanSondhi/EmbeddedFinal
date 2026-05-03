@@ -1,8 +1,9 @@
 #include <Arduino.h>
+
 #include "pin_config.h"
 #include "gpio_reg.h"
 #include "gesture.h"
-#include "storage.h"
+#include "spi_reg.h"
 
 // States and Variables
 enum State { 
@@ -23,18 +24,15 @@ enum Mode {
 static State state = ST_IDLE; // set initial state to idle
 static Mode mode = MODE_RECORD; // set initial mode to record
 static uint8_t gesture_idx = 0; // Index of the current gesture being recorded or attempted (0, 1, or 2 for the three gestures in the combination)
-static GestureBins stored_key[NUM_GESTURES]; // The stored key combination of gestures, loaded from storage if it exists
-static bool key_exists = false; // Indicate if a key was successfully loaded from storage
+static GestureBins stored_key[NUM_GESTURES]; // The stored key combination of gestures, saved only in RAM while the board stays powered on
+static bool key_exists = false; // Indicates if a key has been recorded during the current power cycle
 static unsigned long state_enter_time = 0, last_sample_ms = 0, last_motion_ms = 0; // Timing variables for managing state transitions and gesture capture timing
 static bool saw_motion = false; //Indicate if any motion was detected during the capture phase (used to detect if the user is actually performing a gesture or just holding still)
 static uint8_t anim_tick = 0, retries_left = MAX_RETRIES; // Tracks how many unlock attempts are left before lockout
 
 // Function prototypes
 static void read_accel_raw(int16_t &x, int16_t &y, int16_t &z) { // reads raw accelerometer values into x, y, z
-    CircuitPlayground.lis.read(); // Update the x, y, z values from the LIS3DH (accelerometer) sensor readings
-    x = CircuitPlayground.lis.x;
-    y = CircuitPlayground.lis.y; 
-    z = CircuitPlayground.lis.z; // Store the raw accelerometer readings into the corresponding variables
+    accel_spi_read_xyz(x, y, z); // Read the LIS3DH accelerometer directly through SPI (Function in spi.h)
 }
 
 static void go_to(State s) { // state transition helper
@@ -50,7 +48,9 @@ static bool check_cancel(void) { // checks if both buttons are held to cancel th
         neo_cancel_feedback(); // Flash Neopixel animation to indicate cancellation
         neo_idle_indicator(); // Return to idle LED state
         go_to(ST_IDLE); // Transition back to idle state
-        while (btn_left_raw() || btn_right_raw()) _delay_ms(10); // Wait until both buttons are released before allowing any further actions
+        while (btn_left_raw() || btn_right_raw()) {
+            _delay_ms(10); // Wait until both buttons are released before allowing any further actions
+        }
         return true; // Indicate that the operation was cancelled
     }
 
@@ -100,38 +100,39 @@ static bool do_countdown(void) { // Shows a countdown animation on the NeoPixels
 void setup() {
     Serial.begin(9600); // Initialize serial communication at 9600 baud rate
     unsigned long t0 = millis(); // Record the start time to implement a timeout for waiting
-    while (!Serial && millis() - t0 < 2000) delay(10); // 
+    while (!Serial && millis() - t0 < 2000) {
+        _delay_ms(10); // Wait briefly for Serial Monitor
+    }
 
     gpio_init(); // Initialize GPIO pins and the CircuitPlayground board (Function in gpio_reg.h)
     neo_boot_animation(); // Play the boot animation on the NeoPixels (Function in gpio_reg.h)
 
-    CircuitPlayground.lis.setRange(LIS3DH_RANGE_4_G); // Set the accelerometer range to +/- 4G for better sensitivity to typical hand gestures
-    CircuitPlayground.lis.setDataRate(LIS3DH_DATARATE_50_HZ); // Set the accelerometer data rate to 50Hz, which is sufficient for capturing hand gestures while conserving power
-    Serial.println(F("LIS3DH OK")); // Print a message to the serial monitor indicating that the accelerometer is initialized and working
-
-    key_exists = storage_load(stored_key); // Attempt to load a previously stored key from EEPROM storage. If a key is successfully loaded, set key_exists to true; otherwise, it remains false.
-    if (key_exists) { // If a key was loaded, print a message and flash the NeoPixels green to indicate success
-        Serial.println(F("Key loaded.")); 
-        neo_flash(COLOR_GREEN, 500); 
+    accel_spi_init(); // Initialize SPI and configure the LIS3DH accelerometer (Function in spi.h)
+    if (accel_spi_ok()) { // Check the LIS3DH WHO_AM_I register to make sure the accelerometer is responding over SPI (Function in spi.h)
+        Serial.println(F("LIS3DH SPI OK")); 
     }
-    else { // If no key was found in storage, print a message and flash the NeoPixels orange to indicate that no key is currently stored
-        Serial.println(F("No key stored."));
+    else { // If this message appears, the accelerometer was not detected correctly through SPI
+        Serial.println(F("LIS3DH SPI check failed"));
         neo_flash(COLOR_ORANGE, 500); 
     }
+
+    key_exists = false; // Start with no saved key after every reset/power-on
+    Serial.println(F("No key saved yet. LEFT to record.")); // The user must record a new key each time the board is powered on
+    neo_flash(COLOR_ORANGE, 500);
 
     neo_idle_indicator(); // Set the NeoPixels to the idle state (dim blue) to indicate that we're ready for user input
     go_to(ST_IDLE); // Transition to the idle state to start the main loop
 
     Serial.println(F("\n=== KinetiKey ===")); // Print the welcome message and instructions to the serial monitor
     Serial.print(F(" Retries=")); Serial.println(MAX_RETRIES);
-    Serial.println(F("LEFT=Record | RIGHT=Unlock | LEFT3s=Erase | BOTH=Cancel\n"));
+    Serial.println(F("LEFT=Record | RIGHT=Unlock | LEFT3s=Clear RAM key | BOTH=Cancel\n"));
 }
 
 // State handling functions
 
 // 1) Idle state: wait for user to press either the record button (left) or the unlock button (right)
 static void do_idle(void) {
-    if (btn_left_raw()) { // If the left button is pressed, we want to start the process of recording a new key
+    if (btn_left_pressed()) { // If the left button is pressed, we want to start the process of recording a new key
         unsigned long hs = millis(); // Record the time at which the left button was pressed to implement a long-press detection for erasing the key
         uint8_t lp = 0; // Track how many pixels to light up
 
@@ -148,11 +149,12 @@ static void do_idle(void) {
             }
             if (held >= ERASE_HOLD_MS) { // If the button has been held for long enough to trigger a key erase (3 seconds), perform the erase operation
                 Serial.println(F("*** KEY ERASED ***"));
-                storage_erase(); // Erase the key from storage (EEPROM; function in storage.h)
-                key_exists = false; // Update the key_exists flag to indicate that there is no longer a key stored
+                key_exists = false; // Clear the recorded key from RAM. No EEPROM erase is needed because the key is not saved after power-off
                 neo_erase_animation(); // Play the key erase animation on the NeoPixels (Function in gpio_reg.h)
                 neo_idle_indicator(); // Return to the idle LED state after erasing
-                while (btn_left_raw()) _delay_ms(10); // Wait until the left button is released before allowing any further actions
+                while (btn_left_raw()) {
+                    _delay_ms(10); // Wait until the left button is released before allowing any further actions
+                }
                 return; // return to main loop
             }
             _delay_ms(10); // Check every 10ms for button release or long-press completion
@@ -182,7 +184,9 @@ static void do_idle(void) {
         retries_left = MAX_RETRIES; // Reset the retries left counter to the maximum number of retries allowed before lockout
         mode = MODE_UNLOCK; // Set the mode to unlock so that the rest of the program knows we're in unlocking mode (used for determining colors and behavior in other functions)
         neo_flash(COLOR_YELLOW, 300); // Flash the NeoPixels yellow to indicate that we've entered unlock mode and are ready to start attempting to match gestures
-        while (btn_right_raw()) _delay_ms(10);// Wait until the right button is released before starting the countdown and capture process
+        while (btn_right_raw()) {
+            _delay_ms(10);// Wait until the right button is released before starting the countdown and capture process
+        }
         if (!do_countdown()) return; // Show the countdown animation and if it returns false, it means the user cancelled during the countdown, so we return early to stop the unlock attempt process
         go_to(ST_UNLOCK_WAIT); 
         return;
@@ -262,9 +266,8 @@ static void do_record_capture(void) {
             Serial.print(gesture_idx);
             Serial.println(F("/3 recorded!"));
 
-            if (gesture_idx >= NUM_GESTURES) { // If all gestures in the combination have been recorded, finalize the key storage process
-                storage_save(stored_key); // Save the recorded key (array of gesture bins) to EEPROM storage (Function in storage.h)
-                key_exists = true; // Update the key_exists flag to indicate that we now have a key stored
+            if (gesture_idx >= NUM_GESTURES) { // If all gestures in the combination have been recorded, finalize the key saving process
+                key_exists = true; // Mark that a key now exists in RAM for the current power cycle
                 Serial.println(F("\n*** KEY SAVED ***\n")); // Print a message to the serial monitor indicating that the key has been successfully saved
                 neo_show_progress(NUM_GESTURES, COLOR_PURPLE); // Show a progress animation with all pixels lit in purple to indicate that all gestures have been recorded
                 for (uint16_t i = 0; i < 100; i++) // Briefly show the completed progress animation before transitioning back to idle
@@ -297,8 +300,7 @@ static void do_record_capture(void) {
         gesture_idx++;
 
         if (gesture_idx >= NUM_GESTURES) { 
-            storage_save(stored_key); 
-            key_exists = true; 
+            key_exists = true; // Mark that a key now exists in RAM for the current power cycle 
             Serial.println(F("*** KEY SAVED ***")); 
             neo_saved_animation(); 
             neo_idle_indicator(); 

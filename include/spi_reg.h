@@ -1,7 +1,7 @@
 #ifndef SPI_H
 #define SPI_H
 
-#include <SPI.h>
+#include "SPI.h"
 #include "pin_config.h"
 
 static inline void accel_cs_low(void) { // Select the LIS3DH accelerometer so the microcontroller can communicate with it over SPI
