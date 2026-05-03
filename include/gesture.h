@@ -40,11 +40,13 @@ static void capture_dump_serial(void) { // Debug function to print the raw captu
     }
     Serial.println(F("--- RAW END ---"));
 }
-/* Downsampling is used to convert a gesture with many raw samples 
+/* 
+   Downsampling is used to convert a gesture with many raw samples 
    into a fixed number of points, so all gestures have the same length.
    In this process, DTW is used to compare two gestures even if they are performed
    at slightly different speeds. It aligns the sequences in time. Together, downsampling
-   and DTW make gesture matching more consistent.*/
+   and DTW make gesture matching more consistent.
+*/
 
 // Downsample raw_buf
 static GestureBins downsample(void) { // Process the raw captured gesture data to compute the downsampled and normalized gesture bins for this unlock attempt. 
@@ -52,8 +54,8 @@ static GestureBins downsample(void) { // Process the raw captured gesture data t
     memset(&g, 0, sizeof(g)); // Initialize the gesture bins structure to zero before filling it with the downsampled data. 
     if (raw_count == 0) return g; // If there are no raw samples, return the empty gesture bins structure. 
     for (uint8_t i = 0; i < DTW_SAMPLES; i++) { // Loop through the number of downsampled points we want to compute (DTW_SAMPLES) and fill in the gesture bins by selecting the appropriate raw samples from the raw_buf based on their index. 
-        uint16_t idx = (uint16_t)((uint32_t)i * (raw_count - 1) / (DTW_SAMPLES - 1));
-        if (idx >= raw_count) idx = raw_count - 1;
+        uint16_t idx = (uint16_t)((uint32_t)i * (raw_count - 1) / (DTW_SAMPLES - 1)); // Compute the index in the raw_buf that corresponds to the i-th downsampled point.
+        if (idx >= raw_count) idx = raw_count - 1; // Ensure that the computed index does not go out of bounds of the raw_buf array. If it does, we set it to the last valid index in raw_buf.
         g.x[i] = raw_buf[idx].x;
         g.y[i] = raw_buf[idx].y;
         g.z[i] = raw_buf[idx].z;
@@ -90,33 +92,40 @@ static void compute_normalized_mags(const GestureBins *g, float *mags) {
 }
 
 // Banded DTW on normalized magnitude sequences
+// We use a DTW in order to align the two gestures temporally when computing the distance between them, so that if the 
+// user performs the same gesture at slightly different speeds during recording and unlock attempts, we can still consider it a close match. 
+
 static float dtw_on_mags(const float *a, const float *b) {
     uint8_t N = DTW_SAMPLES; // Length of the sequences we're comparing (after downsampling)
     float prev[DTW_SAMPLES + 1]; // Previous row of the DTW matrix
     float curr[DTW_SAMPLES + 1]; // Current row of the DTW matrix
 
     for (uint8_t j = 0; j <= N; j++) prev[j] = 1e9f; // Initialize the first row of the DTW matrix to a large value (infinity) to represent the cost of aligning an empty sequence with the first j points of the other sequence.
-    prev[0] = 0;
+    prev[0] = 0; // Aligning two empty sequences has zero cost
 
-    for (uint8_t i = 1; i <= N; i++) { // Loop through each point in the first sequence
+    for (uint8_t i = 1; i <= N; i++) { // Loop through each point in the first gesture sequence
         for (uint8_t j = 0; j <= N; j++) curr[j] = 1e9f; // Initialize the current row of the DTW matrix to a large value (infinity) for the same reason as above, since we haven't computed any costs for aligning points yet.
-
-        uint8_t j_start = (i > DTW_BAND) ? (i - DTW_BAND) : 1; // 
-        uint8_t j_end   = (i + DTW_BAND < N) ? (i + DTW_BAND) : N;
-
+        
+        // Limit how far the matching path can move away from the diagonal of the DTW matrix (DTW band)
+        // Prevents unrealistic matches where the gestures are aligned in a way that stretches one gesture too much compared to the other
+        uint8_t j_start = (i > DTW_BAND) ? (i - DTW_BAND) : 1; // We start from 1 because the 0th column represents aligning with an empty sequence, which we've already initialized in prev.
+        uint8_t j_end   = (i + DTW_BAND < N) ? (i + DTW_BAND) : N; // We end at N because the columns go from 0 to N, where the 0th column is the empty sequence case and the Nth column is aligning all points.
+        
+        // Compare current point in gesture a with allowed nearby points in gesture b
         for (uint8_t j = j_start; j <= j_end; j++) {
-            float cost = fabs(a[i - 1] - b[j - 1]);
+            float cost = fabs(a[i - 1] - b[j - 1]); // How different these points are
 
-            float m = prev[j - 1];
-            if (prev[j] < m) m = prev[j];
-            if (curr[j - 1] < m) m = curr[j - 1];
+            float m = prev[j - 1]; // Diagonal (match both points)
+            if (prev[j] < m) m = prev[j]; // Up (stretch gesture b)
+            if (curr[j - 1] < m) m = curr[j - 1]; // Left (stretch gesture a)
 
-            curr[j] = cost + m;
+            curr[j] = cost + m; // Store the best total cost to align the first i points of gesture a with the first j points of gesture b
         }
 
+        // Move current row into prev for the next iteration
         for (uint8_t j = 0; j <= N; j++) prev[j] = curr[j];
     }
-
+    // Final DTW distance
     return prev[N] / N;
 }
 
