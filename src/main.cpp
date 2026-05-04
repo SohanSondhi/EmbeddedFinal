@@ -3,7 +3,6 @@
 #include "pin_config.h"
 #include "gpio_reg.h"
 #include "gesture.h"
-#include "storage.h"
 #include "spi_reg.h"
 
 enum State {
@@ -95,9 +94,9 @@ void setup() {
         neo_flash(COLOR_ORANGE, 500);
     }
 
-    key_exists = storage_load(stored_key);
-    if (key_exists) { Serial.println(F("Key loaded.")); neo_flash(COLOR_GREEN, 500); }
-    else             { Serial.println(F("No key stored. LEFT to record.")); neo_flash(COLOR_ORANGE, 500); }
+    key_exists = false;
+    Serial.println(F("No key stored. LEFT to record."));
+    neo_flash(COLOR_ORANGE, 500);
 
     neo_idle_indicator();
     go_to(ST_IDLE);
@@ -125,7 +124,6 @@ static void do_idle(void) {
             }
             if (held >= ERASE_HOLD_MS) {
                 Serial.println(F("*** KEY ERASED ***"));
-                storage_erase();
                 key_exists = false;
                 neo_erase_animation();
                 neo_idle_indicator();
@@ -231,7 +229,6 @@ static void do_record_capture(void) {
             Serial.print(F("  G")); Serial.print(gesture_idx); Serial.println(F("/3 recorded!"));
 
             if (gesture_idx >= NUM_GESTURES) {
-                storage_save(stored_key);
                 key_exists = true;
                 Serial.println(F("\n*** KEY SAVED ***\n"));
                 neo_show_progress(NUM_GESTURES, COLOR_PURPLE);
@@ -262,7 +259,6 @@ static void do_record_capture(void) {
         gesture_idx++;
 
         if (gesture_idx >= NUM_GESTURES) {
-            storage_save(stored_key);
             key_exists = true;
             Serial.println(F("*** KEY SAVED ***"));
             neo_saved_animation();
