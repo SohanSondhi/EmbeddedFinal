@@ -1,8 +1,6 @@
 #ifndef PIN_CONFIG_H
 #define PIN_CONFIG_H
 
-#include <avr/io.h>
-
 // Variables used for pin configuration and state tracking for buttons, LEDs, NeoPixels, and other hardware components. These variables are defined here for easy reference and modification throughout the codebase.
 
 // Left Button (D4 = PD4) — ACTIVE HIGH

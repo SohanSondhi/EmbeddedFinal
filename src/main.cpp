@@ -28,7 +28,7 @@ static GestureBins stored_key[NUM_GESTURES]; // The stored key combination of ge
 static bool key_exists = false; // Indicates if a key has been recorded during the current power cycle
 static unsigned long state_enter_time = 0, last_sample_ms = 0, last_motion_ms = 0; // Timing variables for managing state transitions and gesture capture timing
 static bool saw_motion = false; //Indicate if any motion was detected during the capture phase (used to detect if the user is actually performing a gesture or just holding still)
-static uint8_t anim_tick = 0, retries_left = MAX_RETRIES; // Tracks how many unlock attempts are left before lockout
+static uint8_t retries_left = MAX_RETRIES; // Tracks how many unlock attempts are left before lockout
 
 // Function prototypes
 static void read_accel_raw(int16_t &x, int16_t &y, int16_t &z) { // reads raw accelerometer values into x, y, z
@@ -39,7 +39,6 @@ static void go_to(State s) { // state transition helper
     state = s; // Update the current state to the new state 's'
     state_enter_time = millis(); // Record the time at which we entered this state (used for timing out if the user takes too long to perform a gesture)
     saw_motion = false; // Reset the motion detection flag whenever we enter a new state, so we can track if the user performs any motion during the gesture capture phase
-    anim_tick = 0; // Reset the animation tick counter for LED feedback animations
 }
 
 static bool check_cancel(void) { // checks if both buttons are held to cancel the current operation, returns true if cancelled
@@ -58,7 +57,7 @@ static bool check_cancel(void) { // checks if both buttons are held to cancel th
 }
 
 static bool do_countdown(void) { // Shows a countdown animation on the NeoPixels and checks for cancellation. Returns true if countdown completes without cancellation, false if cancelled.
-    uint32_t c = (mode == MODE_RECORD) ? COLOR_PURPLE : COLOR_YELLOW; // Set the color based on whether we're in record mode (purple) or unlock mode (yellow)
+    uint32_t c = (mode == MODE_RECORD) ? COLOR_BLUE : COLOR_YELLOW; // Set the color based on whether we're in record mode (purple) or unlock mode (yellow)
     uint32_t pc = (mode == MODE_RECORD) ? COLOR_PURPLE : COLOR_GREEN; // Set the progress color (used during countdown) based on mode (purple for record, green for unlock)
     
     Serial.print(F("  Ready G")); Serial.print(gesture_idx + 1); // Print which gesture number we're about to record or attempt (1, 2, or 3)
@@ -205,8 +204,7 @@ static void do_record_wait(void) {
         return; 
     }
 
-    if ((millis()/400)%2==0) neo_waiting_pulse(COLOR_PURPLE, gesture_idx); // While waiting for the user to perform the gesture, show a pulsing animation on the NeoPixels to indicate that we're waiting for input. The color is purple since we're in record mode, and the number of pixels lit corresponds to how many gestures have already been recorded in this session.
-    else neo_show_progress(gesture_idx, COLOR_PURPLE); // Alternate between the pulsing animation and a static progress display to create a blinking effect while waiting
+    neo_show_progress(gesture_idx, COLOR_PURPLE); // While waiting for the user to perform the gesture, show a progress animation to indicate how many gestures have already been successfully recorded. The color is purple since we're in record mode, and the number of pixels lit corresponds to how many gestures have already been successfully recorded so far in this combination (e.g. if we're on gesture 2, light up pixels 0-1 to indicate that gesture 1 has been recorded)
 
     int16_t x, y, z;
     read_accel_raw(x, y, z); // Read the raw accelerometer values into x, y, z variables
@@ -234,9 +232,8 @@ static void do_record_capture(void) {
     if (now - last_sample_ms < SAMPLE_RATE_MS) return; // If it's not time to take the next sample yet (based on the defined sample rate), return early and wait until the next loop iteration to check again.
 
     last_sample_ms = now; // Update the last sample time to the current time
-    anim_tick++; // Increment the animation tick counter for the LED feedback animation during capture
 
-    neo_capturing_tick(COLOR_PURPLE, gesture_idx, anim_tick); // Update the NeoPixel animation to indicate that we're actively capturing a gesture. The color is purple since we're in record mode, and the animation may show which gesture number we're on and provide some visual feedback during the capture process (Function in gpio_reg.h)
+    neo_capturing_tick(COLOR_PURPLE, gesture_idx); // Update the NeoPixel animation to indicate that we're actively capturing a gesture. The color is purple since we're in record mode, and the animation may show which gesture number we're on and provide some visual feedback during the capture process (Function in gpio_reg.h)
     int16_t x, y, z;
     read_accel_raw(x, y, z); // Read the raw accelerometer values into x, y, z variables to capture the current state of motion for this sample
     bool moving = is_moving_raw(x, y, z); // Determine if the user is currently moving based on the accelerometer readings (Function in gesture.h). 
@@ -252,7 +249,7 @@ static void do_record_capture(void) {
         if (saw_motion && (now - last_motion_ms > STILLNESS_MS)) { // If we've seen motion before and it's been long enough since we last detected motion (indicating that the user has likely finished performing the gesture), we proceed to finalize the capture of this gesture
             if (!capture_valid()) { // If the captured gesture data is not valid (e.g. too short, not enough samples; Function in gesture.h), we consider this a failed capture attempt and prompt the user to try again without advancing to the next gesture
                 Serial.println(F("  Too short!")); // Print message indicating that the captured gesture was too short or invalid
-                neo_flash(COLOR_ORANGE, 300); // Flash the NeoPixels orange to indicate that the capture was unsuccessful and the user needs to try again
+                neo_flash(COLOR_RED, 300); // Flash the NeoPixels red to indicate that the capture was unsuccessful and the user needs to try again
                 if (!do_countdown()) return; // Show the countdown animation again to prompt the user to perform the gesture, and if they cancel during the countdown, return early to stop the recording process
                 go_to(ST_RECORD_WAIT); return; 
             }
@@ -270,11 +267,10 @@ static void do_record_capture(void) {
                 key_exists = true; // Mark that a key now exists in RAM for the current power cycle
                 Serial.println(F("\n*** KEY SAVED ***\n")); // Print a message to the serial monitor indicating that the key has been successfully saved
                 neo_show_progress(NUM_GESTURES, COLOR_PURPLE); // Show a progress animation with all pixels lit in purple to indicate that all gestures have been recorded
-                for (uint16_t i = 0; i < 100; i++) // Briefly show the completed progress animation before transitioning back to idle
-                    _delay_ms(10);
-                    neo_saved_animation(); // Play the saved key animation on the NeoPixels to indicate that the key has been saved (Function in gpio_reg.h)
-                    neo_idle_indicator(); 
-                    go_to(ST_IDLE);
+                for (uint16_t i = 0; i < 100; i++) _delay_ms(10); // Briefly show the completed progress animation before transitioning back to idle
+                neo_saved_animation(); // Play the saved key animation on the NeoPixels to indicate that the key has been saved (Function in gpio_reg.h)
+                neo_idle_indicator(); 
+                go_to(ST_IDLE);
             } 
 
             else { // If there are more gestures to record in the combination, prompt the user to perform the next gesture
@@ -289,7 +285,7 @@ static void do_record_capture(void) {
     }
     if (raw_count >= MAX_SAMPLES) { // If we've reached the maximum number of samples for this gesture capture, we need to finalize the capture even if the user is still moving, since we can't capture any more data for this gesture
         if (!capture_valid()) { // If the captured gesture data is not valid (Function in gesture.h), consider this a failed capture attempt
-            neo_flash(COLOR_ORANGE, 200); // Flash the NeoPixels orange to indicate that the capture was unsuccessful and the user needs to try again
+            neo_flash(COLOR_RED, 200); // Flash the NeoPixels red to indicate that the capture was unsuccessful and the user needs to try again
             if (!do_countdown()) return; // Show the countdown animation again to prompt the user to perform the gesture, and if they cancel during the countdown, return early to stop the recording process
             go_to(ST_RECORD_WAIT); // Transition back to the state where we wait for the user to perform the gesture again since this capture attempt was not valid
             return; 
@@ -327,8 +323,7 @@ static void do_unlock_wait(void) {
         return; 
     }
 
-    if ((millis()/400)%2==0) neo_waiting_pulse(COLOR_YELLOW, gesture_idx); // While waiting for the user to perform the gesture, show a pulsing animation on the NeoPixels to indicate that we're waiting for input. The color is yellow since we're in unlock mode, and the number of pixels lit corresponds to how many gestures have already been successfully matched in this unlock attempt.
-    else neo_show_progress(gesture_idx, COLOR_GREEN); // Alternate between the pulsing animation and a static progress display to create a blinking effect while waiting. The progress display uses green pixels to indicate how many gestures have been successfully matched so far in this unlock attempt.
+    neo_show_progress(gesture_idx, COLOR_GREEN); // While waiting for the user to perform the gesture, show a progress animation to indicate how many gestures have already been successfully matched in this unlock attempt. The color is green since we're in unlock mode, and the number of pixels lit corresponds to how many gestures have already been successfully matched so far in this unlock attempt (e.g. if we're on gesture 2, light up pixels 0-1 to indicate that gesture 1 has been successfully matched)
 
     int16_t x, y, z;
     read_accel_raw(x, y, z); // Read the raw accelerometer values into x, y, z variables to capture the current state of motion for this sample
@@ -355,8 +350,7 @@ static void do_unlock_capture(void) {
 
     if (now - last_sample_ms < SAMPLE_RATE_MS) return; // If it's not time to take the next sample yet (based on the defined sample rate), return early and wait until the next loop iteration to check again.
     last_sample_ms = now; // Update the last sample time to the current time
-    anim_tick++; // Increment the animation tick counter for the LED feedback animation during capture
-    neo_capturing_tick(COLOR_YELLOW, gesture_idx, anim_tick); // Update the NeoPixel animation to indicate that we're actively capturing a gesture for the unlock attempt. The color is yellow since we're in unlock mode, and the animation may show which gesture number we're on and provide some visual feedback during the capture process (Function in gpio_reg.h)
+    neo_capturing_tick(COLOR_YELLOW, gesture_idx); // Update the NeoPixel animation to indicate that we're actively capturing a gesture for the unlock attempt. The color is yellow since we're in unlock mode, and the animation may show which gesture number we're on and provide some visual feedback during the capture process (Function in gpio_reg.h)
     
     int16_t x, y, z; 
     read_accel_raw(x, y, z); // Read the raw accelerometer values into x, y, z variables to capture the current state of motion for this sample
@@ -418,7 +412,7 @@ static void do_unlock_capture(void) {
                     go_to(ST_FAILED); // Transition to the failed state to play the failure animation
                 }
                 else { // If there are still retries left for this gesture, prompt the user to try performing this gesture again
-                    neo_flash(COLOR_ORANGE, 400); // Flash the NeoPixels orange to indicate that the attempt to match this gesture was unsuccessful and the user needs to try again
+                    neo_flash(COLOR_RED, 400); // Flash the NeoPixels red to indicate that the attempt to match this gesture was unsuccessful and the user needs to try again
                     neo_show_progress(gesture_idx, COLOR_GREEN); // Update the progress animation to show how many gestures have been successfully matched so far in green, which remains the same since this attempt was unsuccessful
                     for (uint16_t i = 0; i < 100; i++) _delay_ms(10); 
                     if (!do_countdown()) return; 
@@ -468,7 +462,7 @@ static void do_unlock_capture(void) {
                 go_to(ST_FAILED); 
             } else { // If there are still retries left for this gesture, prompt the user to try performing this gesture again
                 Serial.println(F(" TRY AGAIN"));
-                neo_flash(COLOR_ORANGE, 400);
+                neo_flash(COLOR_RED, 400);
                 if (!do_countdown()) return;
                 go_to(ST_UNLOCK_WAIT); // Transition back to the state where we wait for the user to perform this gesture again since this attempt was not successful
             } 
