@@ -62,4 +62,4 @@ Orange blink: Retry as gesture is too short
 # Result
 1. Tested with 3 gestures drawing a number (0-9)
 2. Achieve a good success rate although sometimes gets confused from some similar patterns (Better to have bigger motion when drawing number)
-3. Demo-Video Link: 
+3. Demo-Video Link: https://drive.google.com/file/d/1VzubHkgXRPi2iQStQGSspEWrZTPNSykI/view?usp=sharing
